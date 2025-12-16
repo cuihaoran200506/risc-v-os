@@ -1,8 +1,14 @@
 #include "syscall.h"
 #include "proc/proc.h"
 #include "fs/file.h"
+#include "fs/fs.h"
+#include "fs/dir.h"
+#include "fs/log.h"
+#include "fs/pipe.h"
 #include "mem/vmem.h"
 #include "lib/string.h"
+#include "lib/print.h"
+#include "stat.h"
 
 #define LAB6_MAXPATH 128
 
@@ -45,6 +51,18 @@ static int is_console_path(const char *path)
     }
 }
 
+static int isdirempty(struct inode *dp)
+{
+    struct dirent de;
+    for (uint32 off = 2 * sizeof(de); off < dp->size; off += sizeof(de)) {
+        if (readi(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
+            panic("isdirempty");
+        if (de.inum != 0)
+            return 0;
+    }
+    return 1;
+}
+
 int sys_open(void)
 {
     char path[LAB6_MAXPATH];
@@ -59,7 +77,265 @@ int sys_open(void)
     if (is_console_path(path)) {
         return open_console(p, omode);
     }
-    return -1;
+
+    begin_op();
+
+    struct inode *ip = 0;
+    if (omode & O_CREATE) {
+        ip = inode_create(path, ITYPE_FILE, 0, 0);
+        if (!ip) {
+            end_op();
+            return -1;
+        }
+    } else {
+        ip = namei(path);
+        if (!ip) {
+            end_op();
+            return -1;
+        }
+        ilock(ip);
+    }
+
+    if (ip->type == ITYPE_DIR && omode != O_RDONLY) {
+        iunlockput(ip);
+        end_op();
+        return -1;
+    }
+
+    struct file *f = filealloc();
+    if (!f) {
+        iunlockput(ip);
+        end_op();
+        return -1;
+    }
+    f->type = FD_INODE;
+    f->ip = ip;
+    f->off = 0;
+    f->readable = (omode & O_WRONLY) ? 0 : 1;
+    f->writable = (omode & (O_WRONLY | O_RDWR)) ? 1 : 0;
+
+    int fd = fdalloc(p, f);
+    if (fd < 0) {
+        fileclose(f);
+        iunlockput(ip);
+        end_op();
+        return -1;
+    }
+    iunlock(ip);
+    end_op();
+    return fd;
+}
+
+int sys_mkdir(void)
+{
+    char path[LAB6_MAXPATH];
+    if (argstr(0, path, sizeof(path)) < 0)
+        return -1;
+
+    begin_op();
+    struct inode *ip = inode_create(path, ITYPE_DIR, 0, 0);
+    if (!ip) {
+        end_op();
+        return -1;
+    }
+    iunlockput(ip);
+    end_op();
+    return 0;
+}
+
+int sys_mknod(void)
+{
+    char path[LAB6_MAXPATH];
+    int major, minor;
+    if (argstr(0, path, sizeof(path)) < 0 ||
+        argint(1, &major) < 0 ||
+        argint(2, &minor) < 0) {
+        return -1;
+    }
+    begin_op();
+    struct inode *ip = inode_create(path, ITYPE_DEV, (short)major, (short)minor);
+    if (!ip) {
+        end_op();
+        return -1;
+    }
+    iunlockput(ip);
+    end_op();
+    return 0;
+}
+
+int sys_chdir(void)
+{
+    char path[LAB6_MAXPATH];
+    if (argstr(0, path, sizeof(path)) < 0)
+        return -1;
+    begin_op();
+    struct inode *ip = namei(path);
+    if (!ip) {
+        end_op();
+        return -1;
+    }
+    ilock(ip);
+    if (ip->type != ITYPE_DIR) {
+        iunlockput(ip);
+        end_op();
+        return -1;
+    }
+    iunlock(ip);
+    struct proc *p = myproc();
+    if (!p) {
+        iput(ip);
+        end_op();
+        return -1;
+    }
+    struct inode *old = p->cwd;
+    p->cwd = ip;
+    if (old)
+        iput(old);
+    end_op();
+    return 0;
+}
+
+int sys_fstat(void)
+{
+    int fd;
+    uint64 addr;
+    if (argint(0, &fd) < 0 || argaddr(1, &addr) < 0)
+        return -1;
+    struct proc *p = myproc();
+    if (!p || fd < 0 || fd >= NOFILE)
+        return -1;
+    struct file *f = p->ofile[fd];
+    if (!f)
+        return -1;
+    struct stat st;
+    if (filestat(f, &st) < 0)
+        return -1;
+    if (copyout(p->pagetable, addr, (char*)&st, sizeof(st)) < 0)
+        return -1;
+    return 0;
+}
+
+int sys_dup(void)
+{
+    int fd;
+    if (argint(0, &fd) < 0)
+        return -1;
+    struct proc *p = myproc();
+    if (!p || fd < 0 || fd >= NOFILE)
+        return -1;
+    struct file *f = p->ofile[fd];
+    if (!f)
+        return -1;
+    int newfd = fdalloc(p, f);
+    if (newfd < 0)
+        return -1;
+    filedup(f);
+    return newfd;
+}
+
+int sys_link(void)
+{
+    char old[LAB6_MAXPATH], new[LAB6_MAXPATH];
+    if (argstr(0, old, sizeof(old)) < 0 || argstr(1, new, sizeof(new)) < 0)
+        return -1;
+
+    begin_op();
+    struct inode *ip = namei(old);
+    if (!ip) {
+        end_op();
+        return -1;
+    }
+    ilock(ip);
+    if (ip->type == ITYPE_DIR) {
+        iunlockput(ip);
+        end_op();
+        return -1;
+    }
+    ip->nlink++;
+    inode_update(ip);
+    iunlock(ip);
+
+    char name[DIRSIZ];
+    struct inode *dp = nameiparent(new, name);
+    if (!dp) {
+        ilock(ip);
+        ip->nlink--;
+        inode_update(ip);
+        iput(ip);
+        end_op();
+        return -1;
+    }
+
+    ilock(dp);
+    if (dirlink(dp, name, ip->inum) < 0) {
+        iunlockput(dp);
+        ilock(ip);
+        ip->nlink--;
+        inode_update(ip);
+        iput(ip);
+        end_op();
+        return -1;
+    }
+    iunlockput(dp);
+    iput(ip);
+    end_op();
+    return 0;
+}
+
+int sys_unlink(void)
+{
+    char path[LAB6_MAXPATH], name[DIRSIZ];
+    if (argstr(0, path, sizeof(path)) < 0)
+        return -1;
+    begin_op();
+    struct inode *dp = nameiparent(path, name);
+    if (!dp) {
+        end_op();
+        return -1;
+    }
+
+    ilock(dp);
+    if (namecmp(name, ".") == 0 || namecmp(name, "..") == 0) {
+        iunlockput(dp);
+        end_op();
+        return -1;
+    }
+
+    uint32 off;
+    struct inode *ip = dirlookup(dp, name, &off);
+    if (!ip) {
+        iunlockput(dp);
+        end_op();
+        return -1;
+    }
+
+    ilock(ip);
+    if (ip->nlink < 1) {
+        panic("unlink: nlink < 1");
+    }
+    if (ip->type == ITYPE_DIR && !isdirempty(ip)) {
+        iunlockput(ip);
+        iunlockput(dp);
+        end_op();
+        return -1;
+    }
+
+    struct dirent de = {0};
+    if (writei(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de)) {
+        panic("unlink: write");
+    }
+    if (ip->type == ITYPE_DIR) {
+        dp->nlink--;
+        inode_update(dp);
+    }
+    iunlock(dp);
+    iput(dp);
+
+    ip->nlink--;
+    inode_update(ip);
+    iunlockput(ip);
+    end_op();
+    return 0;
 }
 
 int sys_close(void)
@@ -144,4 +420,37 @@ int sys_read(void)
             break;
     }
     return total;
+}
+
+int sys_pipe(void)
+{
+    uint64 addr;
+    if (argaddr(0, &addr) < 0)
+        return -1;
+
+    struct file *rf, *wf;
+    if (pipealloc(&rf, &wf) < 0)
+        return -1;
+
+    struct proc *p = myproc();
+    int fd0 = fdalloc(p, rf);
+    int fd1 = fdalloc(p, wf);
+    if (fd0 < 0 || fd1 < 0) {
+        if (fd0 >= 0)
+            p->ofile[fd0] = 0;
+        fileclose(rf);
+        fileclose(wf);
+        return -1;
+    }
+
+    if (copyout(p->pagetable, addr, (char*)&fd0, sizeof(fd0)) < 0 ||
+        copyout(p->pagetable, addr + sizeof(fd0), (char*)&fd1, sizeof(fd1)) < 0) {
+        p->ofile[fd0] = 0;
+        p->ofile[fd1] = 0;
+        fileclose(rf);
+        fileclose(wf);
+        return -1;
+    }
+
+    return 0;
 }

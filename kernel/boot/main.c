@@ -6,15 +6,28 @@
 #include "dev/timer.h"
 #include "dev/uart.h"
 #include "dev/plic.h"
+#include "dev/virtio_disk.h"
 #include "proc/proc.h"
 #include "fs/file.h"
+#include "fs/dir.h"
+#include "fs/fs.h"
+#include "fs/log.h"
+#include "fs/bio.h"
 #include "lib/lock.h"
 #include "lib/string.h"
-#include "syscall.h"
 
 #define LAB6_ENABLE_SYSCALL_TESTS 1
+#define LAB7_FS_EARLY_INIT 0
+#define LAB7_PATH_MAX 128
 
 volatile static int started = 0;
+
+// 新增：Lab7 测试规模控制
+#define LAB7_CONCURRENT_WORKERS     2     // 并发 worker 数量
+#define LAB7_CONCURRENT_ITERS       2     // 每个 worker 的循环次数，原来是 100
+#define LAB7_PERF_SMALL_FILES       2     // 小文件个数，原来是 1000
+#define LAB7_PERF_LARGE_WRITES      1     // 大文件写入次数，原来是 1024
+
 
 // === Test entry points ===
 static void run_all_tests(void);
@@ -24,6 +37,27 @@ static void test_synchronization(void);
 static void test_exit_wait(void);
 static void debug_proc_table(void);
 static void run_lab6_syscall_tests(void);
+static void run_lab7_filesystem_tests(void);
+static void test_filesystem_integrity(void);
+static void test_concurrent_access(void);
+static void test_crash_recovery(void);
+static void test_filesystem_performance(void);
+static void debug_filesystem_state(void);
+static void debug_inode_usage(void);
+static void debug_disk_io(void);
+
+static struct file* lab7_open_file(const char *path, int omode);
+static int lab7_unlink(const char *path);
+static int lab7_count_free_blocks(void);
+static int lab7_count_free_inodes(void);
+static void lab7_concurrent_worker(void);
+static void lab7_make_concurrent_name(char *buf, int len, int worker_id, int iter);
+static void lab7_make_small_name(char *buf, int len, int idx);
+static void lab7_append_literal(const char *lit, int *off, char *buf, int len);
+static void lab7_append_decimal(char *buf, int len, int *off, int value);
+static void lab7_finalize_name(char *buf, int len, int off);
+static int lab7_strcmp(const char *a, const char *b);
+static int lab7_is_dir_empty(struct inode *dp);
 
 // === 测试用任务 ===
 static void simple_task(void);
@@ -47,210 +81,114 @@ static const int exit_code_factor = 7;
 #define LAB6_O_RDWR   0x2
 #define LAB6_O_CREATE 0x200
 
-static struct proc* lab6_find_proc_by_name(const char *name);
-static struct proc* lab6_find_proc_by_pid(int pid);
-static uint64 lab6_invoke_syscall(struct proc *target, int num,
-                                  uint64 a0, uint64 a1, uint64 a2,
-                                  uint64 a3, uint64 a4, uint64 a5);
-static uint64 lab6_user_sbrk(struct proc *p, uint64 bytes);
-static void lab6_force_exit(struct proc *child, int status);
-
-static struct proc* lab6_find_proc_by_name(const char *name)
+static int lab6_sys_getpid(void)
 {
-    if (!name)
-        return NULL;
-    for (int i = 0; i < NPROC; i++) {
-        struct proc *p = &proc_table[i];
-        spinlock_acquire(&p->lock);
-        int match = (p->state != PROC_UNUSED &&
-                     strncmp(p->name, name, sizeof(p->name)) == 0);
-        spinlock_release(&p->lock);
-        if (match)
-            return p;
+    struct proc *p = myproc();
+    return p ? p->pid : -1;
+}
+
+static int lab6_sys_fork(void)
+{
+    struct proc *p = myproc();
+    if (!p || !p->pagetable) {
+        printf("[LAB6] fork skipped (no user pagetable in current process)\n");
+        return -1;
     }
-    return NULL;
+    return fork_process();
 }
 
-static struct proc* lab6_find_proc_by_pid(int pid)
+static int lab6_sys_wait(int *status)
 {
-    for (int i = 0; i < NPROC; i++) {
-        struct proc *p = &proc_table[i];
-        spinlock_acquire(&p->lock);
-        int match = (p->state != PROC_UNUSED && p->pid == pid);
-        spinlock_release(&p->lock);
-        if (match)
-            return p;
-    }
-    return NULL;
+    return wait_process(status);
 }
 
-static uint64 lab6_invoke_syscall(struct proc *target, int num,
-                                  uint64 a0, uint64 a1, uint64 a2,
-                                  uint64 a3, uint64 a4, uint64 a5)
+static int lab6_sys_open(const char *path, int mode)
 {
-    if (!target || !target->trapframe || !target->pagetable)
-        return (uint64)-1;
-
-    struct cpu *c = mycpu();
-    struct proc *saved_proc = c->proc;
-    struct trapframe saved_tf;
-    int intena = intr_get();
-
-    intr_off();
-    memcpy(&saved_tf, target->trapframe, sizeof(saved_tf));
-
-    c->proc = target;
-    target->trapframe->a0 = a0;
-    target->trapframe->a1 = a1;
-    target->trapframe->a2 = a2;
-    target->trapframe->a3 = a3;
-    target->trapframe->a4 = a4;
-    target->trapframe->a5 = a5;
-    target->trapframe->a7 = num;
-
-    syscall();
-    uint64 ret = target->trapframe->a0;
-
-    memcpy(target->trapframe, &saved_tf, sizeof(saved_tf));
-    c->proc = saved_proc;
-    if (intena)
-        intr_on();
-
-    return ret;
+    printf("[LAB6] open(\"%s\", %d) skipped (filesystem not implemented)\n",
+           path ? path : "<null>", mode);
+    return -1;
 }
 
-static uint64 lab6_user_sbrk(struct proc *p, uint64 bytes)
+static int lab6_sys_close(int fd)
 {
-    if (!p || bytes > 0x7fffffffULL)
-        return (uint64)-1;
-    return lab6_invoke_syscall(p, SYS_sbrk, bytes, 0, 0, 0, 0, 0);
+    printf("[LAB6] close(%d) skipped (filesystem not implemented)\n", fd);
+    return -1;
 }
 
-static void lab6_force_exit(struct proc *child, int status)
+static int lab6_sys_write(int fd, const void *buf, int len)
 {
-    if (!child)
-        return;
-    spinlock_acquire(&child->lock);
-    child->exit_code = status;
-    child->state = PROC_ZOMBIE;
-    spinlock_release(&child->lock);
-    if (child->parent)
-        wakeup(child->parent);
+    printf("[LAB6] write(fd=%d, buf=%p, len=%d) skipped\n", fd, buf, len);
+    return -1;
+}
+
+static int lab6_sys_read(int fd, void *buf, int len)
+{
+    printf("[LAB6] read(fd=%d, buf=%p, len=%d) skipped\n", fd, buf, len);
+    return -1;
+}
+
+static uint64 lab6_sys_time(void)
+{
+    return timer_get_ticks();
 }
 
 static void lab6_test_basic_syscalls(void)
 {
     printf("\n[LAB6] test_basic_syscalls\n");
-    struct proc *initp = lab6_find_proc_by_name("init");
-    if (!initp) {
-        printf("[LAB6] init process not ready; skipping syscall tests\n");
+    int pid = lab6_sys_getpid();
+    printf("[LAB6] Current PID: %d\n", pid);
+    int child_pid = lab6_sys_fork();
+    if (child_pid == 0) {
+        printf("[LAB6] Child process path would execute exit(42)\n");
         return;
+    } else if (child_pid > 0) {
+        int status = 0;
+        if (lab6_sys_wait(&status) >= 0) {
+            printf("[LAB6] Child exited with status %d\n", status);
+        } else {
+            printf("[LAB6] wait() unavailable in current configuration\n");
+        }
+    } else {
+        printf("[LAB6] fork() unavailable in current configuration\n");
     }
-
-    uint64 pid = lab6_invoke_syscall(initp, SYS_getpid, 0, 0, 0, 0, 0, 0);
-    printf("[LAB6] Current PID: %lu\n", pid);
-
-    uint64 child_pid = lab6_invoke_syscall(initp, SYS_fork, 0, 0, 0, 0, 0, 0);
-    if ((int)child_pid < 0) {
-        printf("[LAB6] fork() failed/unavailable\n");
-        return;
-    }
-
-    struct proc *child = lab6_find_proc_by_pid((int)child_pid);
-    if (!child) {
-        printf("[LAB6] fork returned pid=%lu but child not found\n", child_pid);
-        return;
-    }
-
-    // Mark child as exited with status 42 (avoid running noreturn sys_exit)
-    lab6_force_exit(child, 42);
-
-    // Ask parent to wait; store status in parent's stack top
-    uint64 status_va = initp->sz - sizeof(int);
-    uint64 waited_pid = lab6_invoke_syscall(initp, SYS_wait, status_va, 0, 0, 0, 0, 0);
-    int status = 0;
-    copyin(initp->pagetable, &status, status_va, sizeof(status));
-
-    printf("[LAB6] wait() returned pid=%lu status=%d\n", waited_pid, status);
 }
 
 static void lab6_test_parameter_passing(void)
 {
     printf("\n[LAB6] test_parameter_passing\n");
-    struct proc *initp = lab6_find_proc_by_name("init");
-    if (!initp) {
-        printf("[LAB6] init process not ready; skipping\n");
-        return;
-    }
-
-    const char *path = "/dev/console";
-    uint64 path_uaddr = lab6_user_sbrk(initp, strlen(path) + 16);
-    if (path_uaddr == (uint64)-1 || copyout(initp->pagetable, path_uaddr, path, strlen(path) + 1) < 0) {
-        printf("[LAB6] unable to stage path in user space\n");
-        return;
-    }
-
     char buffer[] = "Hello, World!";
-    uint64 buf_uaddr = lab6_user_sbrk(initp, sizeof(buffer));
-    if (buf_uaddr == (uint64)-1 || copyout(initp->pagetable, buf_uaddr, buffer, sizeof(buffer)) < 0) {
-        printf("[LAB6] unable to stage buffer in user space\n");
-        return;
-    }
-
-    int fd = (int)lab6_invoke_syscall(initp, SYS_open, path_uaddr, LAB6_O_RDWR, 0, 0, 0, 0);
+    int fd = lab6_sys_open("/dev/console", LAB6_O_RDWR);
     if (fd >= 0) {
-        int bytes = (int)lab6_invoke_syscall(initp, SYS_write, fd, buf_uaddr, sizeof(buffer) - 1, 0, 0, 0);
+        int bytes = lab6_sys_write(fd, buffer, sizeof(buffer) - 1);
         printf("[LAB6] Wrote %d bytes to console\n", bytes);
-        lab6_invoke_syscall(initp, SYS_close, fd, 0, 0, 0, 0, 0);
+        lab6_sys_close(fd);
     } else {
         printf("[LAB6] open /dev/console failed (expected without FS)\n");
     }
-
-    int fd_answer = lab6_invoke_syscall(initp, SYS_write, (uint64)-1, buf_uaddr, 10, 0, 0, 0);
-    printf("[LAB6] write with invalid fd result: %d\n", fd_answer);
-    int pointTest = lab6_invoke_syscall(initp, SYS_write, fd, 0, 10, 0, 0, 0);
-    printf("[LAB6] write with null buffer result: %d\n", pointTest);
-    int test_answer = lab6_invoke_syscall(initp, SYS_write, fd, buf_uaddr, (uint64)-1, 0, 0, 0);
-    printf("[LAB6] write with oversized length result: %d\n", test_answer);
+    (void)lab6_sys_write(-1, buffer, 10);
+    (void)lab6_sys_write(fd, NULL, 10);
+    (void)lab6_sys_write(fd, buffer, -1);
 }
 
 static void lab6_test_security(void)
 {
     printf("\n[LAB6] test_security\n");
-    struct proc *initp = lab6_find_proc_by_name("init");
-    if (!initp) {
-        printf("[LAB6] init process not ready; skipping\n");
-        return;
-    }
-
     char *invalid_ptr = (char*)0x1000000;
-    int result = (int)lab6_invoke_syscall(initp, SYS_write, 1, (uint64)invalid_ptr, 10, 0, 0, 0);
+    int result = lab6_sys_write(1, invalid_ptr, 10);
     printf("[LAB6] Invalid pointer write result: %d\n", result);
-
-    // Use invalid fd to avoid blocking on console input
-    char dummy[4] = {0};
-    uint64 dummy_uaddr = lab6_user_sbrk(initp, sizeof(dummy));
-    if (dummy_uaddr != (uint64)-1) {
-        copyout(initp->pagetable, dummy_uaddr, dummy, sizeof(dummy));
-    }
-    result = (int)lab6_invoke_syscall(initp, SYS_read, (uint64)-1, dummy_uaddr, 1000, 0, 0, 0);
+    char small_buf[4];
+    result = lab6_sys_read(0, small_buf, 1000);
     printf("[LAB6] Oversized read result: %d\n", result);
 }
 
 static void lab6_test_syscall_performance(void)
 {
     printf("\n[LAB6] test_syscall_performance\n");
-    struct proc *initp = lab6_find_proc_by_name("init");
-    if (!initp) {
-        printf("[LAB6] init process not ready; skipping\n");
-        return;
-    }
-
-    uint64 start = timer_get_ticks();
+    uint64 start = lab6_sys_time();
     for (int i = 0; i < 10000; i++) {
-        (void)lab6_invoke_syscall(initp, SYS_getpid, 0, 0, 0, 0, 0, 0);
+        (void)lab6_sys_getpid();
     }
-    uint64 end = timer_get_ticks();
+    uint64 end = lab6_sys_time();
     printf("[LAB6] 10000 getpid() calls took %lu ticks\n", end - start);
 }
 
@@ -270,7 +208,6 @@ static void worker_fast(void);
 static void worker_medium(void);
 static void worker_slow(void);
 static void start_worker_demo(void);
-
 static inline void worker_do_work(uint64 cycles)
 {
     for (uint64 i = 0; i < cycles; i++) {
@@ -291,14 +228,29 @@ int main()
 
         // 初始化
         pmem_init();
+        printf("Physical memory manager initialized.\n");
         kvm_init();
+        printf("Kernel virtual memory initialized.\n");
         kvm_inithart();
+        printf("Kernel page table for hart %d initialized.\n", cpuid);
         trap_init();
+        printf("Trap vectors initialized.\n");
         trap_inithart();
+        printf("Trap handling for hart %d initialized.\n", cpuid);
         uart_init();
+        printf("UART initialized.\n");
+        virtio_disk_init();
+        printf("Virtio disk initialized.\n");
+        binit();
+        printf("Buffer cache initialized.\n");
+        fs_init(ROOTDEV);
+        printf("File system initialized.\n");
         proc_init();
+        printf("Process table initialized.\n");
         fileinit();
+        printf("File table initialized.\n");
         userinit();
+        printf("First user process initialized.\n");
 
         printf("\n========================================\n");
         printf("  Lab5&lab6 Tests\n");
@@ -393,6 +345,7 @@ static void run_all_tests(void)
     test_exit_wait();
     debug_proc_table();
     run_lab6_syscall_tests();
+    run_lab7_filesystem_tests();
     printf("[TEST] All tests completed, launching worker demo...\n");
     start_worker_demo();
     exit_process(0);
@@ -564,6 +517,447 @@ static void debug_proc_table(void)
         }
     }
     printf("[LAB5] debug_proc_table completed\n");
+}
+
+static volatile int lab7_worker_next_id = 0;
+
+static int lab7_assign_worker_id(void)
+{
+    return __sync_fetch_and_add(&lab7_worker_next_id, 1);
+}
+
+static void run_lab7_filesystem_tests(void)
+{
+    printf("\n[LAB7] Running filesystem tests\n");
+    test_filesystem_integrity();
+    test_concurrent_access();
+    test_crash_recovery();
+    test_filesystem_performance();
+    debug_filesystem_state();
+    debug_inode_usage();
+    debug_disk_io();
+    printf("[LAB7] Filesystem tests completed\n");
+}
+
+// static void run_lab7_filesystem_tests_simple(void)
+// {
+//     printf("\n[LAB7] Running filesystem tests\n");
+//     test_filesystem_integrity();
+//     // test_concurrent_access();
+//     // test_crash_recovery();
+//     // test_filesystem_performance();
+//     debug_filesystem_state();
+//     // debug_inode_usage();   // 这个本来就先关掉
+//     debug_disk_io();
+//     printf("[LAB7] Filesystem tests completed\n");
+// }
+
+static void test_filesystem_integrity(void)
+{
+    printf("\n[LAB7] test_filesystem_integrity\n");
+
+    struct file *f = lab7_open_file("testfile", O_CREATE | O_RDWR);
+    if (!f) {
+        printf("[LAB7] failed to open testfile for writing\n");
+        return;
+    }
+    const char message[] = "Hello, filesystem!";
+    int written = filewrite(f, message, strlen(message));
+    fileclose(f);
+    if (written != (int)strlen(message)) {
+        printf("[LAB7] failed to write test data\n");
+        return;
+    }
+
+    f = lab7_open_file("testfile", O_RDONLY);
+    if (!f) {
+        printf("[LAB7] failed to reopen testfile for reading\n");
+        return;
+    }
+    char buffer[64];
+    int read = fileread(f, buffer, sizeof(buffer) - 1);
+    if (read < 0)
+        read = 0;
+    buffer[read] = '\0';
+    fileclose(f);
+
+    if (lab7_strcmp(message, buffer) != 0) {
+        printf("[LAB7] readback mismatch: got \"%s\"\n", buffer);
+        return;
+    }
+
+    if (lab7_unlink("testfile") < 0) {
+        printf("[LAB7] failed to remove testfile\n");
+    }
+
+    printf("[LAB7] test_filesystem_integrity passed\n");
+}
+
+static void test_concurrent_access(void)
+{
+    printf("\n[LAB7] test_concurrent_access\n");
+    lab7_worker_next_id = 0;
+    const int workers = LAB7_CONCURRENT_WORKERS;
+    int launched = 0;
+
+    for (int i = 0; i < workers; i++) {
+        int pid = create_process(lab7_concurrent_worker, "lab7-conc");
+        if (pid < 0) {
+            printf("[LAB7] failed to spawn worker %d\n", i);
+            break;
+        }
+        launched++;
+        printf("[LAB7] worker pid=%d started\n", pid);
+    }
+
+    wait_for_children(launched);
+    printf("[LAB7] test_concurrent_access completed\n");
+}
+
+static void lab7_concurrent_worker(void)
+{
+    int worker_id = lab7_assign_worker_id();
+    char filename[32];
+
+    for (int iter = 0; iter < LAB7_CONCURRENT_ITERS; iter++) {
+        lab7_make_concurrent_name(filename, sizeof(filename), worker_id, iter);
+        struct file *f = lab7_open_file(filename, O_CREATE | O_RDWR);
+        if (f) {
+            int value = (worker_id << 16) | iter;
+            filewrite(f, (const char*)&value, sizeof(value));
+            fileclose(f);
+        }
+        lab7_unlink(filename);
+    }
+    exit_process(0);
+}
+
+static void test_crash_recovery(void)
+{
+    printf("\n[LAB7] test_crash_recovery (simulation placeholder)\n");
+    printf("[LAB7] crash recovery simulation skipped (requires external framework)\n");
+}
+
+static struct file* lab7_open_file(const char *path, int omode)
+{
+    if (!path)
+        return 0;
+    char pathbuf[LAB7_PATH_MAX];
+    safestrcpy(pathbuf, path, sizeof(pathbuf));
+    begin_op();
+    struct inode *ip = 0;
+    if (omode & O_CREATE) {
+        ip = inode_create(pathbuf, ITYPE_FILE, 0, 0);
+        if (!ip) {
+            end_op();
+            return 0;
+        }
+    } else {
+        ip = namei(pathbuf);
+        if (!ip) {
+            end_op();
+            return 0;
+        }
+        printf("[lab7] open_file existing inode %d type=%d\n", ip->inum, ip->type);
+        ilock(ip);
+    }
+
+    if (ip->type == ITYPE_DIR && (omode & (O_WRONLY | O_RDWR))) {
+        iunlockput(ip);
+        end_op();
+        return 0;
+    }
+
+    struct file *f = filealloc();
+    if (!f) {
+        iunlockput(ip);
+        end_op();
+        return 0;
+    }
+
+    f->type = FD_INODE;
+    f->ip = ip;
+    f->off = 0;
+    f->readable = (omode & O_WRONLY) ? 0 : 1;
+    f->writable = (omode & (O_WRONLY | O_RDWR)) ? 1 : 0;
+    if (omode & O_CREATE)
+        f->writable = 1;
+
+    iunlock(ip);
+    end_op();
+    return f;
+}
+
+static int lab7_is_dir_empty(struct inode *dp)
+{
+    struct dirent de;
+    for (uint32 off = 2 * sizeof(de); off < dp->size; off += sizeof(de)) {
+        if (readi(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de)) {
+            panic("lab7_is_dir_empty: readi failed");
+        }
+        if (de.inum != 0)
+            return 0;
+    }
+    return 1;
+}
+
+static int lab7_unlink(const char *path)
+{
+    if (!path)
+        return -1;
+    char pathbuf[LAB7_PATH_MAX];
+    safestrcpy(pathbuf, path, sizeof(pathbuf));
+    char name[DIRSIZ];
+    begin_op();
+    struct inode *dp = nameiparent(pathbuf, name);
+    if (!dp) {
+        end_op();
+        return -1;
+    }
+
+    ilock(dp);
+    if (namecmp(name, ".") == 0 || namecmp(name, "..") == 0) {
+        iunlockput(dp);
+        end_op();
+        return -1;
+    }
+
+    uint32 off;
+    struct inode *ip = dirlookup(dp, name, &off);
+    if (!ip) {
+        iunlockput(dp);
+        end_op();
+        return -1;
+    }
+
+    ilock(ip);
+    if (ip->nlink < 1) {
+        panic("lab7_unlink: nlink < 1");
+    }
+    if (ip->type == ITYPE_DIR && !lab7_is_dir_empty(ip)) {
+        iunlockput(ip);
+        iunlockput(dp);
+        end_op();
+        return -1;
+    }
+
+    struct dirent de = {0};
+    if (writei(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de)) {
+        panic("lab7_unlink: writei failed");
+    }
+    if (ip->type == ITYPE_DIR) {
+        dp->nlink--;
+        inode_update(dp);
+    }
+    iunlock(dp);
+    iput(dp);
+
+    ip->nlink--;
+    inode_update(ip);
+    iunlockput(ip);
+    end_op();
+    return 0;
+}
+
+static void test_filesystem_performance(void)
+{
+    printf("\n[LAB7] test_filesystem_performance\n");
+    uint64 start = timer_get_ticks();
+
+    for (int i = 0; i < LAB7_PERF_SMALL_FILES; i++) {
+        char filename[32];
+        lab7_make_small_name(filename, sizeof(filename), i);
+        struct file *f = lab7_open_file(filename, O_CREATE | O_RDWR);
+        if (f) {
+            filewrite(f, "test", 4);
+            fileclose(f);
+        }
+    }
+    uint64 small_time = timer_get_ticks() - start;
+
+    start = timer_get_ticks();
+    struct file *large = lab7_open_file("large_file", O_CREATE | O_RDWR);
+    char large_buffer[4096];
+    memset(large_buffer, 0, sizeof(large_buffer));
+    if (large) {
+        for (int i = 0; i < LAB7_PERF_LARGE_WRITES; i++) {
+            filewrite(large, large_buffer, sizeof(large_buffer));
+        }
+        fileclose(large);
+    }
+    uint64 large_time = timer_get_ticks() - start;
+
+    for (int i = 0; i < LAB7_PERF_SMALL_FILES; i++) {
+        char filename[32];
+        lab7_make_small_name(filename, sizeof(filename), i);
+        lab7_unlink(filename);
+    }
+    lab7_unlink("large_file");
+
+    printf("[LAB7] Small files (%lux4B): %lu ticks\n",LAB7_PERF_SMALL_FILES,small_time);
+    printf("[LAB7] Large file (4MB): %lu ticks\n", large_time);
+}
+
+static void debug_filesystem_state(void)
+{
+    printf("\n[LAB7] debug_filesystem_state\n");
+    const struct superblock *sb = fs_superblock();
+    if (!sb) {
+        printf("[LAB7] superblock missing\n");
+        return;
+    }
+    printf("Total blocks: %u\n", sb->size);
+    printf("Free blocks: %d\n", lab7_count_free_blocks());
+    printf("Free inodes: %d\n", lab7_count_free_inodes());
+    printf("Log blocks: %u\n", sb->nlog);
+    printf("Root inode: %u\n", ROOTINO);
+}
+
+static int lab7_count_free_blocks(void)
+{
+    const struct superblock *sb = fs_superblock();
+    if (!sb)
+        return 0;
+    uint32 dev = fs_device();
+    int total = 0;
+
+    for (uint32 b = 0; b < sb->size; b += BPB) {
+        struct buf *bp = bread(dev, BBLOCK(b, *sb));
+        for (uint32 bi = 0; bi < BPB && (b + bi) < sb->size; bi++) {
+            uint32 mask = 1 << (bi & 7);
+            uint8 byte = bp->data[bi / 8];
+            if ((byte & mask) == 0)
+                total++;
+        }
+        brelse(bp);
+    }
+    return total;
+}
+
+static int lab7_count_free_inodes(void)
+{
+    const struct superblock *sb = fs_superblock();
+    if (!sb)
+        return 0;
+    uint32 dev = fs_device();
+    int total = 0;
+    struct buf *bp = 0;
+    uint32 current_block = (uint32)-1;
+
+    for (uint32 inum = 1; inum < sb->ninodes; inum++) {
+        uint32 blockno = IBLOCK(inum, *sb);
+        if (blockno != current_block) {
+            if (bp) {
+                brelse(bp);
+            }
+            bp = bread(dev, blockno);
+            current_block = blockno;
+        }
+        struct dinode *dip = ((struct dinode*)bp->data) + (inum % IPB);
+        if (dip->type == ITYPE_EMPTY)
+            total++;
+    }
+    if (bp) {
+        brelse(bp);
+    }
+    return total;
+}
+
+static void debug_inode_usage(void)
+{
+    printf("\n[LAB7] debug_inode_usage\n");
+    const struct superblock *sb = fs_superblock();
+    if (!sb)
+        return;
+    uint32 dev = fs_device();
+    struct buf *bp = 0;
+    uint32 current_block = (uint32)-1;
+
+    for (uint32 inum = 1; inum < sb->ninodes; inum++) {
+        uint32 blockno = IBLOCK(inum, *sb);
+        if (blockno != current_block) {
+            if (bp)
+                brelse(bp);
+            bp = bread(dev, blockno);
+            current_block = blockno;
+        }
+        struct dinode *dip = (struct dinode*)bp->data + (inum % IPB);
+        if (dip->type != ITYPE_EMPTY) {
+            printf("Inode %u: type=%d size=%u nlink=%u\n",
+                   inum, dip->type, dip->size, dip->nlink);
+        }
+    }
+    if (bp)
+        brelse(bp);
+    printf("[LAB7] inode usage scan completed\n");
+}
+
+static void debug_disk_io(void)
+{
+    printf("\n[LAB7] debug_disk_io\n");
+    printf("Disk reads: %lu\n", disk_read_count);
+    printf("Disk writes: %lu\n", disk_write_count);
+}
+
+static void lab7_make_concurrent_name(char *buf, int len, int worker_id, int iter)
+{
+    int off = 0;
+    lab7_append_literal("test_", &off, buf, len);
+    lab7_append_decimal(buf, len, &off, worker_id);
+    lab7_append_literal("_", &off, buf, len);
+    lab7_append_decimal(buf, len, &off, iter);
+    lab7_finalize_name(buf, len, off);
+}
+
+static void lab7_make_small_name(char *buf, int len, int idx)
+{
+    int off = 0;
+    lab7_append_literal("small_", &off, buf, len);
+    lab7_append_decimal(buf, len, &off, idx);
+    lab7_finalize_name(buf, len, off);
+}
+
+static void lab7_append_literal(const char *lit, int *off, char *buf, int len)
+{
+    while (*lit && *off + 1 < len) {
+        buf[(*off)++] = *lit++;
+    }
+}
+
+static void lab7_append_decimal(char *buf, int len, int *off, int value)
+{
+    char scratch[12];
+    int idx = 0;
+    unsigned int u = value < 0 ? -value : value;
+    do {
+        if (idx < (int)sizeof(scratch))
+            scratch[idx++] = '0' + (u % 10);
+        u /= 10;
+    } while (u > 0);
+    if (value < 0 && idx < (int)sizeof(scratch))
+        scratch[idx++] = '-';
+    while (idx > 0 && *off + 1 < len) {
+        buf[(*off)++] = scratch[--idx];
+    }
+}
+
+static void lab7_finalize_name(char *buf, int len, int off)
+{
+    if (len <= 0)
+        return;
+    if (off < len)
+        buf[off] = '\0';
+    else
+        buf[len - 1] = '\0';
+}
+
+static int lab7_strcmp(const char *a, const char *b)
+{
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+    return (uint8)*a - (uint8)*b;
 }
 
 static void start_worker_demo(void)

@@ -4,6 +4,7 @@
 #include "mem/pmem.h"
 #include "mem/vmem.h"
 #include "memlayout.h"
+#include "fs/fs.h"
 #include "proc/proc.h"
 #include "trap/trap.h"
 #include "riscv.h"
@@ -95,6 +96,7 @@ static struct proc* alloc_process(void (*entry)(void), const char *name)
     for (int i = 0; i < NOFILE; i++) {
         p->ofile[i] = 0;
     }
+    p->cwd = 0;
 
     if (name && *name) {
         strncpy(p->name, name, sizeof(p->name) - 1);
@@ -257,6 +259,7 @@ void userinit(void)
         f->writable = 1;
         p->ofile[fd] = f;
     }
+    p->cwd = iget(fs_device(), ROOTINO);
     p->state = PROC_RUNNABLE;
 
     spinlock_release(&p->lock);
@@ -301,6 +304,11 @@ int fork_process(void)
         } else {
             np->ofile[i] = 0;
         }
+    }
+    if (p->cwd) {
+        np->cwd = idup(p->cwd);
+    } else {
+        np->cwd = 0;
     }
 
     np->state = PROC_RUNNABLE;
@@ -459,6 +467,10 @@ static void free_process(struct proc *p)
             fileclose(p->ofile[i]);
             p->ofile[i] = 0;
         }
+    }
+    if (p->cwd) {
+        iput(p->cwd);
+        p->cwd = 0;
     }
 
     p->pid = 0;

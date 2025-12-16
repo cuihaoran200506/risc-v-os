@@ -2,6 +2,7 @@
 #include "dev/timer.h"
 #include "dev/uart.h"
 #include "dev/plic.h"
+#include "dev/virtio_disk.h"
 #include "trap/trap.h"
 #include "proc/proc.h"
 #include "memlayout.h"
@@ -118,6 +119,7 @@ void trap_init(void)
 
     // 注册 UART 的中断处理函数
     register_interrupt(UART_IRQ, uart_intr);
+    register_interrupt(VIRTIO_IRQ, virtio_disk_intr);
 }
 
 void trap_inithart(void)
@@ -130,6 +132,7 @@ void trap_inithart(void)
 
     // 为当前 hart 使能 UART 外设中断
     enable_interrupt(UART_IRQ);
+    enable_interrupt(VIRTIO_IRQ);
 }
 
 // 保留原名字做一层兼容封装（其他文件还用的话也能编）

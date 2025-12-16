@@ -15,9 +15,11 @@
 #define TRAMPOLINE (MAXVA - PGSIZE)
 #define TRAPFRAME  (TRAMPOLINE - PGSIZE)
 
-// UART 相关
-#define UART_BASE  0x10000000ul
-#define UART_IRQ   10
+// UART / VirtIO 相关
+#define UART_BASE   0x10000000ul
+#define UART_IRQ    10
+#define VIRTIO0     0x10001000ul
+#define VIRTIO_IRQ  1
 
 // 内核基地址
 #define KERNEL_BASE 0x80000000ul

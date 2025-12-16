@@ -96,6 +96,7 @@ struct proc {
     pagetable_t pagetable;    // 用户页表
     struct trapframe *trapframe; // 用户态寄存器快照
     struct file *ofile[16];
+    struct inode *cwd;
 
     void (*entry)(void);  // 运行的函数
 };

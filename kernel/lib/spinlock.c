@@ -3,19 +3,20 @@
 #include "proc/proc.h"
 #include "riscv.h"
 
-// 全局中断嵌套计数
-static int ncli = 0;
-static int intena = 0;
+// per-CPU interrupt nesting counts
+static int ncli[NCPU];
+static int intena[NCPU];
 
 // 关闭中断（带嵌套计数）
 void push_off(void)
 {
+    int cpu = mycpuid();
     unsigned long old = r_sstatus();
     intr_off();
-    if (ncli == 0) {
-        intena = (old & SSTATUS_SIE) != 0;
+    if (ncli[cpu] == 0) {
+        intena[cpu] = (old & SSTATUS_SIE) != 0;
     }
-    ncli += 1;
+    ncli[cpu] += 1;
 }
 
 // 恢复中断（带嵌套计数）
@@ -24,10 +25,11 @@ void pop_off(void)
     if (r_sstatus() & SSTATUS_SIE)
         panic("pop_off - interruptible");
 
-    if (--ncli < 0)
+    int cpu = mycpuid();
+    if (--ncli[cpu] < 0)
         panic("pop_off - ncli < 0");
 
-    if (ncli == 0 && intena)
+    if (ncli[cpu] == 0 && intena[cpu])
         intr_on();
 }
 

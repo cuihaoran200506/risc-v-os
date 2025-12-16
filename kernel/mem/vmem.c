@@ -146,9 +146,9 @@ void kvm_init() {
     }
     memset(kernel_pgtbl, 0, PGSIZE);
 
-    // 2. 映射硬件设备: UART
-    // 将 UART 寄存器的物理地址映射到等值的虚拟地址
+    // 2. 映射硬件设备: UART / VirtIO
     vm_mappages(kernel_pgtbl, UART_BASE, UART_BASE, PGSIZE, PTE_R | PTE_W);
+    vm_mappages(kernel_pgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
     
 
     // 3. 映射硬件设备: PLIC
@@ -198,6 +198,7 @@ static void print_permissions(pte_t pte) {
 static const char* get_region_name(uint64 va, uint64 pa) {
     // 根据虚拟地址判断区域
     if (va == UART_BASE) return "UART";
+    if (va == VIRTIO0) return "VIRTIO";
     if (va >= PLIC_BASE && va < PLIC_BASE + 0x400000) return "PLIC";
     if (va >= KERNEL_BASE && va < (uint64)etext) return "KERNEL_TEXT";
     if (va >= (uint64)etext && va < PHYSTOP) return "KERNEL_DATA";
