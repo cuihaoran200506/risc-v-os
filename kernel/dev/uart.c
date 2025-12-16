@@ -30,6 +30,7 @@
 #define WriteReg(reg, v) (*(Reg(reg)) = (v))
 
 extern volatile int panicked; // from printf.c
+extern volatile int panicking; // from printf.c
 
 // uart 初始化
 void uart_init(void)

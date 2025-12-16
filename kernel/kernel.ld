@@ -1,4 +1,3 @@
-/* kernel/kernel.ld */
 OUTPUT_ARCH( "riscv" )
 ENTRY( _entry )
 
@@ -9,37 +8,37 @@ SECTIONS
   .text : {
     *(.text .text.*)
     . = ALIGN(0x1000);
-
-    /* trampoline area (not used here, but keep if present) */
+    /*
     _trampoline = .;
-    KEEP(*(.trampsec))
+    *(trampsec)
     . = ALIGN(0x1000);
+    ASSERT(. - _trampoline == 0x1000, "error: trampoline larger than one page");
+    */
+    PROVIDE(etext = .);
   }
 
   .rodata : {
+    . = ALIGN(16);
+    *(.srodata .srodata.*) /* do not need to distinguish this from .rodata */
+    . = ALIGN(16);
     *(.rodata .rodata.*)
   }
 
   .data : {
     . = ALIGN(16);
-    *(.sdata .sdata.*)
+    PROVIDE(KERNEL_DATA = .);
+    *(.sdata .sdata.*) /* do not need to distinguish this from .data */
     . = ALIGN(16);
     *(.data .data.*)
   }
 
-  /* bss */
   .bss : {
     . = ALIGN(16);
-    *(.sbss .sbss.*)
+    *(.sbss .sbss.*) /* do not need to distinguish this from .bss */
     . = ALIGN(16);
     *(.bss .bss.*)
-    . = ALIGN(16);
   }
-  /* 导出 bss 的起止符号用于汇编清零 */
-  PROVIDE(edata = ADDR(.bss));
-  PROVIDE(end = .);
 
-  /DISCARD/ : {
-    *(.eh_frame)
-  }
+  PROVIDE(end = .);
+  PROVIDE(ALLOC_BEGIN = .);
 }

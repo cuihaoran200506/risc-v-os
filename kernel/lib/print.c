@@ -7,26 +7,11 @@
 #include "dev/console.h"
 
 /* 全局 panic 标志（需要在 BSS 清零后为 0） */
-int panicked = 0;
+volatile int panicking = 0; // printing a panic message
+volatile int panicked = 0;  // have called panic()
 
 /* 用于保护打印的自旋锁 */
-static spinlock_t print_lk;
-
-/* 低级单字符打印 */
-// static void print_putc(char c) {
-//     /* 在 panic 状态下仍尽量输出 */
-//     if (!panicked) {
-//         uart_putc_sync((int)c);
-//     }
-// }
-
-/*低级字符打印（经由console层）*/
-static void print_putc(char c) {
-    /* 在 panic 状态下仍尽量输出 */
-    if (!panicked) {
-        console_putc((int)c);
-    }
-}
+static spinlock_t print_lk; 
 
 /* 初始化打印子系统（只要幂等即可） */
 void print_init(void)
@@ -34,6 +19,14 @@ void print_init(void)
     //uart_init(); //配置波特率，FIFO，引脚复用等
     console_init(); //初始化控制台,通过console层完成底层UART初始化
     spinlock_init(&print_lk, "print"); 
+}
+
+/*低级字符打印（经由console层）*/
+static void print_putc(char c) {
+    /* 在 panic 状态下仍尽量输出 */
+    if (!panicked) {
+        console_putc((int)c);
+    }
 }
 
 /* 简单的内核 puts */
@@ -47,7 +40,7 @@ void puts(const char *s)
     spinlock_release(&print_lk);
 }
 
-/* 输出无符号数（base 可为 10 或 16） */
+/* 输出无符号数（base 可为 10 或 16） */ //等价于printint
 static void print_number(unsigned long num, int base, int sign)
 {
     char buf[32];
@@ -68,60 +61,85 @@ static void print_number(unsigned long num, int base, int sign)
     while (i--) print_putc(buf[i]);
 }
 
-/* 简单 printf（支持 %s %d %x %p %c %%） */
-void printf(const char *fmt, ...) //可变参数函数
+/*  复杂printf，支持 l等 */
+// Print to the console. only understands %d, %x, %p, %s.
+void printf(const char *fmt, ...)
 {
-    va_list ap; //声明一个参数指针
-    va_start(ap, fmt); // 让ap指向第一个可变参数，fmt后面的参数
+  va_list ap;
+  int i, cx, c0, c1, c2;
 
-    spinlock_acquire(&print_lk); //自旋锁
+  if(panicking == 0)
+    spinlock_acquire(&print_lk);
 
-    const char *p = fmt;
-    while (p && *p) {
-        if (*p != '%') {
-            print_putc(*p++);
-            continue;
-        }
-        p++;
-        if (*p == 's') { //处理%s —— 字符串
-            char *s = va_arg(ap, char*);
-            if (!s) //s为空，输出NUll
-                s = "(null)";
-            while (*s) //否则，逐字符输出字符串
-                print_putc(*s++);
-        } else if (*p == 'd') { //处理十进制
-            int d = va_arg(ap, int); //取出一个参数
-            /*修复，先转成long再转无符号，保留符号位用于附属判断*/
-            //print_number((unsigned long)d, 10, 1);
-            print_number((unsigned long)(long)d, 10, 1);
-        } else if (*p == 'x') { //十六进制
-            unsigned int x = va_arg(ap, unsigned int);
-            print_number((unsigned long)x, 16, 0);
-        } else if (*p == 'p') {
-            unsigned long x = va_arg(ap, unsigned long);
-            print_number(x, 16, 0);
-        } else if (*p == 'c') { //字符
-            int c = va_arg(ap, int);
-            print_putc((char)c);
-        } else if (*p == '%') {
-            print_putc('%');
-        } else {
-            /* 未知格式，原样输出 */
-            print_putc('%');
-            if (*p) print_putc(*p);
-        }
-        if (*p) p++;
+  va_start(ap, fmt);
+  for(i = 0; (cx = fmt[i] & 0xff) != 0; i++){
+    if(cx != '%'){
+        uart_putc_sync(cx); // 修改点: consputc -> uart_putc_sync
+        continue;}
+    i++;
+    c0 = fmt[i+0] & 0xff;
+    c1 = c2 = 0;
+    if(c0) c1 = fmt[i+1] & 0xff;
+    if(c1) c2 = fmt[i+2] & 0xff;
+    if(c0 == 'd'){
+        print_number(va_arg(ap, int), 10, 1);
+    } else if(c0 == 'l' && c1 == 'd'){
+        print_number(va_arg(ap, long), 10, 1);
+        i += 1;
+    } else if(c0 == 'l' && c1 == 'l' && c2 == 'd'){
+        print_number(va_arg(ap, long long), 10, 1);
+        i += 2;
+    } else if(c0 == 'u'){
+        print_number(va_arg(ap, uint32), 10, 0);
+    } else if(c0 == 'l' && c1 == 'u'){
+        print_number(va_arg(ap, unsigned long), 10, 0);
+        i += 1;
+    } else if(c0 == 'l' && c1 == 'l' && c2 == 'u'){
+        print_number(va_arg(ap, uint64), 10, 0);
+        i += 2;
+    } else if(c0 == 'x'){
+        print_number(va_arg(ap, uint32), 16, 0);
+    } else if(c0 == 'l' && c1 == 'x'){
+        print_number(va_arg(ap, unsigned long), 16, 0);
+        i += 1;
+    } else if(c0 == 'l' && c1 == 'l' && c2 == 'x'){
+        print_number(va_arg(ap, uint64), 16, 0);
+        i += 2;
+    } else if(c0 == 'p'){
+        unsigned long x = va_arg(ap, unsigned long);
+        print_number(x, 16, 0);
+    } else if(c0 == 'c'){
+        int c = va_arg(ap, int);
+        print_putc((char)c);
+    } else if(c0 == 's'){
+        char *s = va_arg(ap, char*);
+        if (!s) //s为空，输出NUll
+            s = "(null)";
+        while (*s) //否则，逐字符输出字符串
+            print_putc(*s++);
+    } else if(c0 == '%'){
+        print_putc('%');
+    } else if(c0 == 0){
+        break;
+    } else {// Print unknown % sequence to draw attention.
+        print_putc('%'); 
+        print_putc(c0); 
     }
 
+  }
+  va_end(ap);
+
+  if(panicking == 0)
     spinlock_release(&print_lk);
 
-    va_end(ap); //清理va_list
 }
 
 /* panic 与 assert 实现 */
 void panic(const char *s)
 {
-    panicked = 1;
+    push_off(); //禁止中断
+    //阶段1：进入“正在崩溃”状态，阻止其他 CPU 继续运行
+    panicking = 1; 
     /* 在 panic 中尽量不依赖锁（锁可能不安全），直接逐字符写串口 */
     if (s) {
         const char *p = "panic: ";
@@ -139,7 +157,8 @@ void panic(const char *s)
 
 void assert(bool condition, const char* warning)
 {
-    if (!condition) panic(warning);
+    if (!condition) 
+        panic(warning);
 }
 
 /* === ANSI-based console helpers === */
@@ -191,3 +210,54 @@ void set_color(int fg, int bg) {
 void reset_color(void) {
     print_puts("\x1b[0m");
 }
+
+
+// /* 简单 printf（支持 %s %d %x %p %c %%） */
+// void printf(const char *fmt, ...) //可变参数函数
+// {
+//     va_list ap; //声明一个参数指针
+//     va_start(ap, fmt); // 让ap指向第一个可变参数，fmt后面的参数
+
+//     spinlock_acquire(&print_lk); //自旋锁
+
+//     const char *p = fmt;
+//     while (p && *p) {
+//         if (*p != '%') {
+//             print_putc(*p++);
+//             continue;
+//         }
+//         p++;
+//         if (*p == 's') { //处理%s —— 字符串
+//             char *s = va_arg(ap, char*);
+//             if (!s) //s为空，输出NUll
+//                 s = "(null)";
+//             while (*s) //否则，逐字符输出字符串
+//                 print_putc(*s++);
+//         } else if (*p == 'd') { //处理十进制
+//             int d = va_arg(ap, int); //取出一个参数
+//             /*修复，先转成long再转无符号，保留符号位用于附属判断*/
+//             //print_number((unsigned long)d, 10, 1);
+//             print_number((unsigned long)(long)d, 10, 1);
+//         } else if (*p == 'x') { //十六进制
+//             unsigned int x = va_arg(ap, unsigned int);
+//             print_number((unsigned long)x, 16, 0);
+//         } else if (*p == 'p') {//指针，按16进制打印
+//             unsigned long x = va_arg(ap, unsigned long);
+//             print_number(x, 16, 0);
+//         } else if (*p == 'c') { //字符
+//             int c = va_arg(ap, int);
+//             print_putc((char)c);
+//         } else if (*p == '%') { //输出百分号
+//             print_putc('%');
+//         } else {
+//             /* 未知格式，原样输出 */
+//             print_putc('%');
+//             if (*p) print_putc(*p);
+//         }
+//         if (*p) p++;
+//     }
+
+//     spinlock_release(&print_lk);
+
+//     va_end(ap); //清理va_list
+// }
