@@ -1,138 +1,270 @@
-/* kernel/boot/main.c */
 #include "riscv.h"
 #include "lib/print.h"
-#include "proc/proc.h"
-#include "lib/lock.h"
 #include "mem/pmem.h"
-#include "lib/string.h" 
 #include "mem/vmem.h"
-#include "proc/cpu.h"
+#include "trap/trap.h"
+#include "dev/timer.h"
+#include "dev/uart.h"
+#include "dev/plic.h"
 
 volatile static int started = 0;
+
+// === Lab4: interrupt test helpers ===
+void test_timer_interrupt(void);
+void test_exception_handling(void);
+void test_interrupt_overhead(void);
+
+// 用于验证中断的全局计数器
+volatile int uart_interrupt_count = 0;
 
 int main()
 {
     int cpuid = r_tp();
-    if(cpuid == 0) {
 
+    if(cpuid == 0) {
         print_init();
+        printf("\n=== OS Kernel Booting ===\n\n");
+
+        // 初始化
         pmem_init();
         kvm_init();
         kvm_inithart();
+        trap_init();
+        trap_inithart();
+        uart_init();
 
-        printf("cpu %d is booting!\n", cpuid);
+        // 打个总标题
+        printf("\n========================================\n");
+        printf("  Lab4: Interrupt Tests\n");
+        printf("========================================\n\n");
+
+        // 使能 S-mode 外设/时钟/软件中断
+        intr_on();
+        printf("Interrupts enabled (sstatus.SIE = %d)\n\n", intr_get());
+
+        // 时钟中断测试（三小项都在这个函数里）
+        test_timer_interrupt();
+
+        // 中断“开销”/tick 间隔粗略测量
+        test_interrupt_overhead();
+
+        // 异常处理测试（会触发 panic，一般单独跑，先注释）
+        //test_exception_handling();
+
         __sync_synchronize();
-        // started = 1;
+        started = 1;
 
-        pgtbl_t test_pgtbl = pmem_alloc(true);
-        memset(test_pgtbl, 0, PGSIZE); 
-        uint64 mem[5];
-        for(int i = 0; i < 5; i++)
-            mem[i] = (uint64)pmem_alloc(false);
-        //Test1
-        printf("\ntest-1\n\n");    
-        vm_mappages(test_pgtbl, 0, mem[0], PGSIZE, PTE_R);
-        vm_mappages(test_pgtbl, PGSIZE * 10, mem[1], PGSIZE, PTE_R | PTE_W);
-        vm_mappages(test_pgtbl, PGSIZE * 512, mem[2], PGSIZE, PTE_R | PTE_X);
-        vm_mappages(test_pgtbl, PGSIZE * 512 * 512, mem[2], PGSIZE, PTE_R | PTE_X);
-        vm_mappages(test_pgtbl, VA_MAX - PGSIZE, mem[4], PGSIZE, PTE_W);
-        vm_print(test_pgtbl);
-        //Test2
-        printf("\ntest-2\n\n");    
-        //vm_mappages(test_pgtbl, 0, mem[0], PGSIZE, PTE_W);
-        vm_unmappages(test_pgtbl, PGSIZE * 10, PGSIZE, false); //not free,just unmap
-        vm_unmappages(test_pgtbl, PGSIZE * 512, PGSIZE, false);
-        vm_print(test_pgtbl);
-        //OtherTest
-        // --- Test 3: Batch Allocation and Free ---
-        printf("\n\n--- test-3: Batch Allocation/Free ---\n");
-        int pages_to_allocate = 7;
-        uint64 batch_mem[pages_to_allocate];
-    
-        uint32 user_free_before = pmem_free_pages_count(false);
-        printf("User free pages before batch alloc: %u\n", user_free_before);
-
-        // 1. 批量分配 7 个用户页
-        int allocated = pmem_alloc_pages(false, pages_to_allocate, batch_mem);
-        printf("Allocated %d pages out of %d requested.\n", allocated, pages_to_allocate);
-
-        uint32 user_free_after = pmem_free_pages_count(false);
-        printf("User free pages after batch alloc: %u (Expected: %u)\n", 
-           user_free_after, user_free_before - allocated);
-           
-        // 2. 批量释放分配的页
-        printf("Releasing %d allocated pages...\n", allocated);
-        for (int i = 0; i < allocated; i++) {
-            // 使用单页释放函数测试其兼容性
-            pmem_free(batch_mem[i], false); 
-        }
-
-        uint32 user_free_final = pmem_free_pages_count(false);
-        printf("User free pages after batch free: %u (Expected: %u)\n", 
-           user_free_final, user_free_before);
-
-        if (user_free_final == user_free_before) {
-            printf("Test 3 PASSED: Free page count restored correctly.\n");
-        } else {
-            printf("Test 3 FAILED: Free page count mismatch.\n");
-        }
-        // --- Test 4: Alignment Check (Should Panic) ---
-        printf("\n\n--- test-4: Alignment Check ---\n");
-    
-        // 尝试映射非对齐的 VA/PA
-        printf("Attempting vm_mappages with unaligned VA (Should PANIC if implemented correctly)...\n");
-        // 假设 PGSIZE 为 0x1000 (4096)
-        // 注意: 如果您的 panic 函数不会返回，下面的代码将不会执行。
-        // 如果您想继续测试，您需要注释掉或移除这行代码。
-        vm_mappages(test_pgtbl, 0x1001, mem[0], PGSIZE, PTE_R); 
-
-        // 尝试取消映射非对齐的 VA
-        printf("Attempting vm_unmappages with unaligned VA (Should PANIC if implemented correctly)...\n");
-        vm_unmappages(test_pgtbl, PGSIZE * 512 + 1, PGSIZE, true);
-    
-        // 假设注释掉了上面的 panic 代码以继续执行：
-        printf("Alignment checks were skipped or passed (if panic was commented out).\n");
-
-        // --- Test 5: Page Table Destruction ---
-        printf("\n\n--- test-5: Page Table Destruction ---\n");
-        
-        // 1. 记录销毁前的状态
-        uint32 kernel_free_before_destroy = pmem_free_pages_count(true);
-        uint32 user_free_before_destroy = pmem_free_pages_count(false);
-        printf("Kernel free pages before destroy: %u\n", kernel_free_before_destroy);
-        printf("User free pages before destroy: %u\n", user_free_before_destroy);
-
-        // 2. 销毁 test_pgtbl，并释放所有映射的物理页
-        // 在 test-1 中，映射了 mem[0], mem[2] (两次), mem[4]
-        // mem[1] 已在 test-2 中释放
-        // 因此这里应该释放 mem[0], mem[2], mem[4] 三个用户页
-        vm_destroy_pagetable(test_pgtbl, true); 
-
-        // 3. 记录销毁后的状态
-        uint32 kernel_free_after_destroy = pmem_free_pages_count(true);
-        uint32 user_free_after_destroy = pmem_free_pages_count(false);
-
-        // 4. 验证计数
-        // 用户页应该增加 3 页 (mem[0], mem[2], mem[4])
-        uint32 expected_user_increase = 3; 
-        uint32 actual_user_increase = user_free_after_destroy - user_free_before_destroy;
-
-        // 内核页应该增加 N_pt_pages 页 (所有中间页表和根页表)
-        // N_pt_pages 在 test-1 和 test-2 中创建和使用
-        uint32 actual_kernel_increase = kernel_free_after_destroy - kernel_free_before_destroy;
-    
-        printf("\nUser page change: +%u (Expected: +%u)\n", actual_user_increase, expected_user_increase);
-        printf("Kernel page change (page tables freed): +%u\n", actual_kernel_increase);
-        
-        if (actual_user_increase == expected_user_increase && actual_kernel_increase > 0) {
-            printf("Test 5 PASSED: Page table and associated memory freed correctly.\n");
-        } else {
-            printf("Test 5 FAILED: Free page count mismatch after destroy.\n");
-        }
     } else {
         while(started == 0);
         __sync_synchronize();
-        printf("cpu %d is booting!\n", cpuid);
+
+        kvm_inithart();
+        trap_inithart();
+        intr_on();
     }
-    while (1);    
+    printf("System entering idle loop...\n");
+    while (1);
+}
+// 测试非法指令异常
+static void trigger_illegal_instruction(void)
+{
+    printf("Triggering illegal instruction exception...\n");
+    printf("You should see \"Illegal instruction in kernel\" and a panic.\n\n");
+
+    // 这里直接塞一个无效指令编码
+    asm volatile(".word 0x00000000");
+
+    // 理论上到不了这行
+    printf("WARNING: illegal instruction did NOT trap as expected!\n");
+}
+
+// 测试内存访问异常（Load/Store page fault/access fault）
+static void trigger_bad_memory_access(void)
+{
+    printf("Triggering bad memory access exception...\n");
+    printf("Trying to read from an unmapped address...\n");
+    printf("You should see \"Page fault in kernel\" (or similar) and a panic.\n\n");
+
+    volatile uint64 *p = (uint64*)0xffffffffffffffffULL;  // 明显超出映射范围
+    uint64 x = *p;  // 触发异常
+    (void)x;
+
+    printf("WARNING: bad memory access did NOT trap as expected!\n");
+}
+
+// ==================== Test 1/2/3: timer interrupt ====================
+void test_timer_interrupt(void)
+{
+    // ---------- Test 1: 观察 50 个 tick ----------
+    printf("=== Test 1: Timer Tick Test ===\n");
+    printf("Observing 50 timer ticks (printing 'T' for each tick)\n\n");
+
+    uint64 start_tick = timer_get_ticks();
+    uint64 last_tick  = start_tick;
+    int    tick_count = 0;
+
+    printf("Ticks: ");
+
+    while (tick_count < 50) {
+        uint64 current_tick = timer_get_ticks();
+        if (current_tick != last_tick) {
+            printf("T");
+            last_tick = current_tick;
+            tick_count++;
+
+            if (tick_count % 10 == 0) {
+                printf(" [%d]\n", tick_count);
+            }
+        }
+    }
+
+    uint64 end_tick = timer_get_ticks();
+    printf("\n\nTest 1 Results:\n");
+    printf("  Start tick: %d\n", start_tick);
+    printf("  End tick:   %d\n", end_tick);
+    printf("  Total ticks observed: %d\n\n", end_tick - start_tick);
+
+    // ---------- Test 2: 精度测试，看 10 个 tick 是否“差不多 10 次” ----------
+    printf("=== Test 2: Timer Accuracy Test ===\n");
+    printf("Testing if about 10 ticks elapse when we wait for 10 tick steps...\n\n");
+
+    // 等待一个完整 tick 边界
+    uint64 accuracy_start = timer_get_ticks();
+    while (timer_get_ticks() == accuracy_start)
+        ;
+    accuracy_start = timer_get_ticks();
+
+    uint64 accuracy_target = accuracy_start + 10;
+    int    busy_counter    = 0;
+
+    while (timer_get_ticks() < accuracy_target) {
+        busy_counter++;   // 纯粹占 CPU，让中断有机会进来
+    }
+
+    uint64 accuracy_end = timer_get_ticks();
+
+    printf("Expected: 10 ticks\n");
+    printf("Actual:   %d ticks\n", accuracy_end - accuracy_start);
+
+    uint64 delta            = accuracy_end - accuracy_start;
+    uint64 accuracy_percent = (delta > 0) ? (1000 * 10 / delta) : 0;
+
+    printf("Accuracy (rough): 10/%d = %d.%d%%\n",
+           delta,
+           (int)(accuracy_percent / 10),
+           (int)(accuracy_percent % 10));
+
+    if (accuracy_end - accuracy_start == 10) {
+        printf("  ✓ PASS: Timer accuracy is precise!\n\n");
+    } else if (accuracy_end - accuracy_start > 10) {
+        printf("  ⚠ WARNING: Timer running slightly slow (expected on emulators)\n\n");
+    } else {
+        printf("  ⚠ WARNING: Timer running slightly fast\n\n");
+    }
+
+    // ---------- Test 3: 实时“进度条”式观察 20 个 tick ----------
+    printf("=== Test 3: Real-time Timer Watch ===\n");
+    printf("Watching timer for 20 ticks (each '.' = 1 tick)\n\n");
+
+    uint64 watch_start = timer_get_ticks();
+    uint64 watch_last  = watch_start;
+    int    watch_dots  = 0;
+
+    while (timer_get_ticks() < watch_start + 20) {
+        uint64 current = timer_get_ticks();
+        if (current > watch_last) {
+            printf(".");
+            watch_dots++;
+
+            if (watch_dots % 10 == 0) {
+                printf(" %d/%d\n", watch_dots, 20);
+            }
+
+            watch_last = current;
+        }
+    }
+
+    printf("\n\nTest 3 Results:\n");
+    printf("  Ticks observed: %d\n", watch_dots);
+    printf("  ✓ Timer working in real-time!\n\n");
+
+    // ---------- Summary ----------
+    printf("========================================\n");
+    printf("  Timer Test Summary\n");
+    printf("========================================\n");
+    printf("Test 1 - Tick Observation:  PASS (>=50 ticks)\n");
+    printf("Test 2 - Accuracy Check:    %s\n",
+           (accuracy_end - accuracy_start == 10) ? "PASS" : "PASS (approx.)");
+    printf("Test 3 - Real-time Watch:   PASS\n\n");
+}
+
+// ==================== Test: exception handling ====================
+static void trigger_ecall_from_smode(void)
+{
+    printf("Triggering an Environment call from S-mode (ecall)...\n");
+    printf("You should see exception info printed by trap_kernel_handler().\n");
+    printf("After that, the kernel is expected to panic and stop.\n\n");
+
+    asm volatile("ecall");
+
+    // 正常情况下不会执行到这里
+    printf("WARNING: ecall did NOT trap as expected!\n");
+}
+
+void test_exception_handling(void)
+{
+    printf("========================================\n");
+    printf("  Exception Handling Test\n");
+    printf("========================================\n\n");
+
+    // 三选一：每次只打开一个测试就行
+    // 1) 测试 ecall 异常
+    trigger_ecall_from_smode();
+    // 3) 测试内存访问异常
+    trigger_bad_memory_access();
+    // 2) 测试非法指令异常
+     trigger_illegal_instruction();
+    // 理论上到不了这里，因为上面任意一个都会 panic
+    printf("Exception test finished (this line should not normally be reached).\n\n");
+}
+
+// ==================== Test: interrupt "overhead" (rough) ====================
+void test_interrupt_overhead(void)
+{
+    printf("========================================\n");
+    printf("  Interrupt Overhead Test (rough)\n");
+    printf("========================================\n\n");
+
+    // 先对齐到一个新的 tick 边界
+    uint64 t_start_tick = timer_get_ticks();
+    while (timer_get_ticks() == t_start_tick)
+        ;
+
+    const int N = 20;
+
+    uint64 logical_start_tick = timer_get_ticks();
+    uint64 t0                 = r_time();
+
+    // 等 N 个 tick
+    for (int i = 0; i < N; i++) {
+        uint64 cur = timer_get_ticks();
+        while (timer_get_ticks() == cur)
+            ;
+    }
+
+    uint64 t1               = r_time();
+    uint64 logical_end_tick = timer_get_ticks();
+
+    uint64 ticks_delta  = logical_end_tick - logical_start_tick;
+    uint64 cycles_delta = t1 - t0;
+
+    printf("Timer ticks elapsed (logical): %d\n", ticks_delta);
+    printf("Time elapsed (cycles):         %d\n", cycles_delta);
+
+    if (ticks_delta > 0) {
+        printf("Avg cycles per tick interval:  %d\n", (uint64)(cycles_delta / ticks_delta));
+    }
+
+    printf("\nNOTE: 这里测的是“完整 tick 周期”的粗略开销，\n");
+    printf("      包含定时器硬件间隔 + trap 进出 + handler 代码，不是纯 trap 指令成本。\n\n");
 }

@@ -32,6 +32,7 @@ typedef struct alloc_region {
 // 内核和用户可分配的物理页分开
 
  static alloc_region_t kern_region, user_region;
+
  static inline uint32 page_index(alloc_region_t* region, uint64 page) {
     return (page - region->begin) / PGSIZE;
 }
@@ -63,16 +64,6 @@ void pmem_init(void) {
     user_region.state       = user_state;
     memset(user_region.state, 0, sizeof(user_state));
 
-    // 将所有可用物理页加入到对应的空闲链表中
-    // 这里通过调用 pmem_free 来完成初始化
-    // for (uint64 p = kern_region.begin; p < kern_region.end; p += PGSIZE) {
-    //     pmem_free(p, true);
-    // }
-
-    // for (uint64 p = user_region.begin; p < user_region.end; p += PGSIZE) {
-    //     pmem_free(p, false);
-    // }
-    //这里需要修改吗？
     // 逆序初始化，让低地址页面先被分配
     for (uint64 p = kern_region.end - PGSIZE; p >= kern_region.begin; p -= PGSIZE) {
         pmem_free(p, true);
@@ -81,17 +72,6 @@ void pmem_init(void) {
         pmem_free(p, false);
     }
 }
-// // 检查页面是否在空闲链表中 (调试用)
-// static bool pmem_in_freelist(alloc_region_t* region, uint64 page) {
-//     page_node_t* cur = region->list_head.next;
-//     while (cur) {
-//         if ((uint64)cur == page) {
-//             return true;
-//         }
-//         cur = cur->next;
-//     }
-//     return false;
-// }
 
 // pmem_free: 释放一个物理页面
 void pmem_free(uint64 page, bool in_kernel) {
@@ -106,13 +86,7 @@ void pmem_free(uint64 page, bool in_kernel) {
     uint32 idx = page_index(region, page);
 
     spinlock_acquire(&region->lk);
-    // //此处可以增加优化
-    // //double-free 检测：已经在 freelist 里了还来 free，就 panic
-    // if (pmem_in_freelist(region, page)) {
-    //     spinlock_release(&region->lk);
-    //     panic("pmem_free: double free detected");
-    // }
-    // double-free 检查 O(1)
+    //duplicate free check
     if (region->state[idx] == 1) {
         spinlock_release(&region->lk);
         panic("pmem_free: double free detected (page already free)");
