@@ -167,6 +167,13 @@ void handle_exception(struct trapframe *tf)
     // 打印人类可读的信息
     printf("Exception in kernel: %s\n", exception_info[exception_id]);
     printf("sepc=%p stval=%p\n", tf->sepc, tf->stval);
+    struct proc *p = myproc();
+    if (p) {
+        printf("proc pid=%d state=%d name=%s entry=%p kstack=%p ctx.ra=%p ctx.sp=%p\n",
+               p->pid, p->state, p->name, p->entry, p->kstack, p->ctx.ra, p->ctx.sp);
+    } else {
+        printf("proc pid=<none>\n");
+    }
 
     switch (cause) {
         case 2:  // Illegal instruction
@@ -217,9 +224,10 @@ void timer_interrupt_handler()
         timer_update();
     }
 
-/*     //预留调度接口
-    if(myproc() != 0 && myproc()->state == RUNNING)
-            yield(); */
+    struct proc *p = myproc();
+    if (p && p->state == PROC_RUNNING) {
+        yield();
+    }
 }
 
 // 在kernel_vector()里面调用
