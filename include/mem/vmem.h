@@ -35,6 +35,7 @@ typedef uint64 pte_t;
 
 // 顶级页表
 typedef uint64* pgtbl_t;
+typedef uint64* pagetable_t;
 
 // satp寄存器相关
 #define SATP_SV39 (8L << 60)  // MODE = SV39
@@ -74,6 +75,16 @@ void   vm_unmappages(pgtbl_t pgtbl, uint64 va, uint64 len, bool freeit);
 // newAdding 
 // 销毁页表
 void   vm_destroy_pagetable(pgtbl_t root, bool free_leaf);
+uint64 vm_walkaddr(pgtbl_t pgtbl, uint64 va);
+int    copyout(pgtbl_t pgtbl, uint64 dstva, const void *src, uint64 len);
+int    copyin(pgtbl_t pgtbl, void *dst, uint64 srcva, uint64 len);
+int    copyinstr(pgtbl_t pgtbl, char *dst, uint64 srcva, uint64 max);
+pagetable_t uvmcreate(void);
+void   uvmfree(pagetable_t pagetable, uint64 sz);
+uint64 uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz);
+uint64 uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz);
+int    uvmcopy(pagetable_t old, pagetable_t new_pt, uint64 sz);
+void   uvmclear(pagetable_t pagetable, uint64 va);
 
 void   kvm_init();
 void   kvm_inithart();

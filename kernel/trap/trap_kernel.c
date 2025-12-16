@@ -1,11 +1,28 @@
- #include "lib/print.h"
+#include "lib/print.h"
 #include "dev/timer.h"
 #include "dev/uart.h"
 #include "dev/plic.h"
 #include "trap/trap.h"
 #include "proc/proc.h"
 #include "memlayout.h"
+#include "mem/vmem.h"
+#include "syscall.h"
 #include "riscv.h"
+
+struct kernel_trapinfo {
+    uint64 sepc;
+    uint64 sstatus;
+    uint64 scause;
+    uint64 stval;
+};
+
+extern char trampoline[];
+extern char uservec[];
+extern char userret[];
+
+static void usertrap(void);
+void usertrapret(void);
+static int handle_interrupt(uint64 scause);
 
 // 中断信息
 static char* interrupt_info[16] = {
@@ -159,7 +176,7 @@ void trap_kernel_inithart(void)
 // }
 
 // 异常处理函数：统一放到这里，trap_kernel_handler 只负责分发
-void handle_exception(struct trapframe *tf)
+static void handle_exception(struct kernel_trapinfo *tf)
 {
     uint64 cause = tf->scause;
     int exception_id = cause & 0xf;
@@ -230,12 +247,35 @@ void timer_interrupt_handler()
     }
 }
 
+static int handle_interrupt(uint64 scause)
+{
+    if ((scause & (1UL << 63)) == 0) {
+        return 0;
+    }
+
+    int interrupt_id = scause & 0xf;
+    switch (interrupt_id) {
+    case 1:
+        // S-mode 软件中断（时钟）
+        w_sip(r_sip() & ~2);
+        timer_interrupt_handler();
+        return 1;
+    case 9:
+        external_interrupt_handler();
+        return 1;
+    default:
+        printf("Unknown interrupt: %s (id=%d)\n",
+               interrupt_info[interrupt_id], interrupt_id);
+        return 0;
+    }
+}
+
 // 在kernel_vector()里面调用
 // 内核态trap处理的核心逻辑
 void trap_kernel_handler(void)
 {
     // 先把几个关键 CSR 摘出来，打包成一个 trapframe
-    struct trapframe tf;
+    struct kernel_trapinfo tf;
     tf.sepc    = r_sepc();      // 发生 trap 时的 PC
     tf.sstatus = r_sstatus();   // 与特权模式和中断相关的状态
     tf.scause  = r_scause();    // trap 原因
@@ -249,32 +289,7 @@ void trap_kernel_handler(void)
 
     // 判断是中断还是异常
     if (tf.scause & (1UL << 63)) {
-        // 最高位为 1 表示中断
-        int interrupt_id = tf.scause & 0xf;
-
-        // 想调试的时候可以打开这一行
-        // printf("Interrupt: %s\n", interrupt_info[interrupt_id]);
-
-        switch (interrupt_id) {
-        case 1:
-            // S-mode 软件中断（来自 M-mode 时钟中断转发）
-            // 清除 SSIP 标志
-            w_sip(r_sip() & ~2);
-            // 处理时钟中断
-            timer_interrupt_handler();
-            break;
-
-        case 9:
-            // S-mode 外设中断（PLIC）
-            external_interrupt_handler();
-            break;
-
-        default:
-            printf("Unknown interrupt: %s (id=%d)\n",
-                   interrupt_info[interrupt_id], interrupt_id);
-            printf("sepc=%p stval=%p\n", tf.sepc, tf.stval);
-            break;
-        }
+        handle_interrupt(tf.scause);
     } else {
         // 最高位为 0：异常，统一交给 handle_exception
         handle_exception(&tf);
@@ -285,4 +300,78 @@ void trap_kernel_handler(void)
     // 这里写回的就是修改后的值
     w_sepc(tf.sepc);
     w_sstatus(tf.sstatus);
+}
+
+static void usertrap(void)
+{
+    struct proc *p = myproc();
+    if (!p || !p->trapframe) {
+        panic("usertrap: no process");
+    }
+    uint64 sstatus = r_sstatus();
+    if (sstatus & SSTATUS_SPP) {
+        panic("usertrap: not from user mode");
+    }
+
+    // trap 返回内核，使用内核向量
+    w_stvec((uint64)kernel_vector);
+
+    p->trapframe->epc = r_sepc();
+    uint64 scause = r_scause();
+
+    if (scause == 8) {
+        if (p->killed) {
+            exit_process(-1);
+        }
+        p->trapframe->epc += 4; // 跳过 ecall
+        intr_on();
+        syscall();
+    } else if (handle_interrupt(scause)) {
+        // 设备中断已处理
+    } else {
+        uint64 stval = r_stval();
+        printf("usertrap: unexpected scause=%p stval=%p pid=%d\n",
+               scause, stval, p->pid);
+        p->killed = 1;
+    }
+
+    if (p->killed) {
+        exit_process(-1);
+    }
+
+    usertrapret();
+}
+
+void usertrapret(void)
+{
+    struct proc *p = myproc();
+    if (!p || !p->trapframe || !p->pagetable) {
+        panic("usertrapret: invalid process state");
+    }
+
+    intr_off();
+
+    uint64 trampoline_uservec = TRAMPOLINE + ((uint64)uservec - (uint64)trampoline);
+    uint64 trampoline_userret = TRAMPOLINE + ((uint64)userret - (uint64)trampoline);
+
+    w_stvec(trampoline_uservec);
+
+    struct trapframe *tf = p->trapframe;
+    tf->kernel_satp = r_satp();
+    tf->kernel_sp = p->kstack + PGSIZE;
+    tf->kernel_trap = (uint64)usertrap;
+    tf->kernel_hartid = r_tp();
+
+    uint64 x = r_sstatus();
+    x &= ~SSTATUS_SPP;  // 将 SPP 设为用户态
+    x |= SSTATUS_SPIE;  // 开启下一次 sret 后的中断
+    w_sstatus(x);
+
+    w_sepc(tf->epc);
+
+    uint64 user_satp = MAKE_SATP(p->pagetable);
+    void (*enter_user)(uint64) = (void (*)(uint64))trampoline_userret;
+    enter_user(user_satp);
+
+    panic("usertrapret: unreachable");
 }

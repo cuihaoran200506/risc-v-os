@@ -12,9 +12,6 @@
 // 中断处理函数类型（用在中断向量表里）
 typedef void (*interrupt_handler_t)(void);
 
-// 先声明一下结构体，后面给出定义
-struct trapframe;
-
 // 顶层 trap 接口（main.c 调这个层）
 void trap_init(void);        // 全局一次性初始化（CPU0）
 void trap_inithart(void);    // 每个 hart 本地初始化
@@ -25,9 +22,7 @@ void trap_kernel_inithart(void);
 
 // S 态 trap 的 C 入口（在 trap.S 的 kernel_vector 里调用）
 void trap_kernel_handler(void);
-
-// 异常处理接口（任务6 里的 handle_exception 原型）
-void handle_exception(struct trapframe *tf);
+void usertrapret(void);
 
 // 中断注册与控制接口（任务3）
 void register_interrupt(int irq, interrupt_handler_t handler);
@@ -37,13 +32,5 @@ void disable_interrupt(int irq);
 // 辅助函数: 外设中断和时钟中断处理
 void external_interrupt_handler(void);
 void timer_interrupt_handler(void);
-
-// 陷阱帧：目前只存 CSR 和 PC，后面做用户态/进程时可以扩展通用寄存器
-struct trapframe {
-    uint64 sepc;     // trap 发生时的 PC
-    uint64 sstatus;  // S 模式状态寄存器
-    uint64 scause;   // trap 原因（中断/异常类型）
-    uint64 stval;    // trap 附加信息（比如 fault 地址）
-};
 
 #endif

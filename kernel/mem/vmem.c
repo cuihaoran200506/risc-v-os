@@ -13,6 +13,7 @@
 #include "lib/print.h"  
 
 static pgtbl_t kernel_pgtbl;
+extern char trampoline[];
 
 extern char etext[]; 
 
@@ -162,6 +163,9 @@ void kvm_init() {
     // 权限为 可读 | 可写 (RW-)
     uint64 pa_for_data = (uint64)etext;
     vm_mappages(kernel_pgtbl, pa_for_data, pa_for_data, PHYSTOP - pa_for_data, PTE_R | PTE_W);
+
+    // 6. 映射 trampoline (供用户态/内核态切换使用)
+    vm_mappages(kernel_pgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
 }
 
 // kvm_inithart: 在每个CPU核上启用分页
@@ -304,5 +308,182 @@ void vm_destroy_pagetable(pgtbl_t root, bool free_leaf) {
     vm_freewalk(root, 2, free_leaf);
     // 最后释放根页表本身
     pmem_free((uint64)root, true);
-    printf("vm_destroy_pagetable: page table destroyed\n");
+}
+
+uint64 vm_walkaddr(pgtbl_t pgtbl, uint64 va)
+{
+    if (va >= MAXVA) {
+        return 0;
+    }
+    pte_t *pte = vm_getpte(pgtbl, va, false);
+    if (pte == NULL) {
+        return 0;
+    }
+    if ((*pte & PTE_V) == 0) {
+        return 0;
+    }
+    if ((*pte & PTE_U) == 0) {
+        return 0;
+    }
+    return PTE_TO_PA(*pte);
+}
+
+int copyout(pgtbl_t pgtbl, uint64 dstva, const void *src, uint64 len)
+{
+    const uint8 *s = (const uint8*)src;
+    while (len > 0) {
+        uint64 va0 = PG_ROUND_DOWN(dstva);
+        uint64 pa0 = vm_walkaddr(pgtbl, va0);
+        if (pa0 == 0) {
+            return -1;
+        }
+        uint64 offset = dstva - va0;
+        uint64 n = PGSIZE - offset;
+        if (n > len) {
+            n = len;
+        }
+        memmove((void*)(pa0 + offset), s, n);
+        len -= n;
+        s += n;
+        dstva = va0 + PGSIZE;
+    }
+    return 0;
+}
+
+int copyin(pgtbl_t pgtbl, void *dst, uint64 srcva, uint64 len)
+{
+    uint8 *d = (uint8*)dst;
+    while (len > 0) {
+        uint64 va0 = PG_ROUND_DOWN(srcva);
+        uint64 pa0 = vm_walkaddr(pgtbl, va0);
+        if (pa0 == 0) {
+            return -1;
+        }
+        uint64 offset = srcva - va0;
+        uint64 n = PGSIZE - offset;
+        if (n > len) {
+            n = len;
+        }
+        memmove(d, (void*)(pa0 + offset), n);
+        len -= n;
+        d += n;
+        srcva = va0 + PGSIZE;
+    }
+    return 0;
+}
+
+int copyinstr(pgtbl_t pgtbl, char *dst, uint64 srcva, uint64 max)
+{
+    uint64 copied = 0;
+    while (copied < max) {
+        uint64 va0 = PG_ROUND_DOWN(srcva);
+        uint64 pa0 = vm_walkaddr(pgtbl, va0);
+        if (pa0 == 0) {
+            return -1;
+        }
+        uint64 offset = srcva - va0;
+        uint64 n = PGSIZE - offset;
+        if (n > max - copied) {
+            n = max - copied;
+        }
+        char *p = (char*)(pa0 + offset);
+        while (n > 0) {
+            copied++;
+            char c = *p;
+            *dst = c;
+            if (c == '\0') {
+                return 0;
+            }
+            p++;
+            dst++;
+            n--;
+        }
+        srcva = va0 + PGSIZE;
+    }
+    return -1;
+}
+
+pagetable_t uvmcreate(void)
+{
+    pagetable_t pagetable = (pagetable_t)pmem_alloc(true);
+    if (pagetable == NULL) {
+        return NULL;
+    }
+    memset(pagetable, 0, PGSIZE);
+    return pagetable;
+}
+
+uint64 uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+{
+    if (newsz < oldsz) {
+        return oldsz;
+    }
+    uint64 a = PG_ROUND_UP(oldsz);
+    for (; a < newsz; a += PGSIZE) {
+        void *mem = pmem_alloc(false);
+        if (mem == NULL) {
+            uvmdealloc(pagetable, a, oldsz);
+            return 0;
+        }
+        memset(mem, 0, PGSIZE);
+        vm_mappages(pagetable, a, (uint64)mem, PGSIZE, PTE_R | PTE_W | PTE_X | PTE_U);
+    }
+    return newsz;
+}
+
+uint64 uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+{
+    if (newsz >= oldsz) {
+        return oldsz;
+    }
+    uint64 a = PG_ROUND_UP(newsz);
+    for (; a < oldsz; a += PGSIZE) {
+        pte_t *pte = vm_getpte(pagetable, a, false);
+        if (pte == NULL) {
+            continue;
+        }
+        if ((*pte & PTE_V) == 0) {
+            continue;
+        }
+        uint64 pa = PTE_TO_PA(*pte);
+        pmem_free(pa, false);
+        *pte = 0;
+    }
+    return newsz;
+}
+
+void uvmfree(pagetable_t pagetable, uint64 sz)
+{
+    if (sz > 0) {
+        uvmdealloc(pagetable, sz, 0);
+    }
+    vm_destroy_pagetable(pagetable, false);
+}
+
+int uvmcopy(pagetable_t old, pagetable_t new_pt, uint64 sz)
+{
+    for (uint64 a = 0; a < sz; a += PGSIZE) {
+        pte_t *pte = vm_getpte(old, a, false);
+        if (pte == NULL || (*pte & PTE_V) == 0) {
+            continue;
+        }
+        uint64 pa = PTE_TO_PA(*pte);
+        uint64 flags = PTE_FLAGS(*pte);
+        void *mem = pmem_alloc(false);
+        if (mem == NULL) {
+            uvmdealloc(new_pt, a, 0);
+            return -1;
+        }
+        memcpy(mem, (void*)pa, PGSIZE);
+        vm_mappages(new_pt, a, (uint64)mem, PGSIZE, flags);
+    }
+    return 0;
+}
+
+void uvmclear(pagetable_t pagetable, uint64 va)
+{
+    pte_t *pte = vm_getpte(pagetable, va, false);
+    if (pte && (*pte & PTE_V)) {
+        *pte &= ~PTE_U;
+    }
 }

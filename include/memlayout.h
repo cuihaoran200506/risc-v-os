@@ -1,6 +1,19 @@
-/* memory leyout */
+/* memory layout */
 #ifndef __MEMLAYOUT_H__
 #define __MEMLAYOUT_H__
+
+// page constants (Sv39)
+#define PGSIZE  4096
+#define PGSHIFT 12
+#define PG_ROUND_UP(sz)  (((sz) + PGSIZE - 1) & ~(PGSIZE-1))
+#define PG_ROUND_DOWN(a) ((a) & ~(PGSIZE-1))
+
+// virtual address ceiling (one below the maximum Sv39 VA)
+#define MAXVA (1L << (9 + 9 + 9 + 12 - 1))
+
+// trampoline/trapframe mapping (highest virtual pages)
+#define TRAMPOLINE (MAXVA - PGSIZE)
+#define TRAPFRAME  (TRAMPOLINE - PGSIZE)
 
 // UART 相关
 #define UART_BASE  0x10000000ul
