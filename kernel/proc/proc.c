@@ -8,6 +8,7 @@
 #include "proc/proc.h"
 #include "trap/trap.h"
 #include "riscv.h"
+#include "dev/timer.h"
 
 extern void swtch(struct context *old, struct context *new);
 extern char trampoline[];
@@ -20,9 +21,13 @@ static int proc_initialized = 0;
 static spinlock_t proc_table_lock;
 static spinlock_t pid_lock;
 
+static const int mlfq_quantum[MLFQ_LEVELS] = { 2, 4, 8 };
+static const int mlfq_aging_threshold = 16;
+
 static struct proc* alloc_process(void (*entry)(void), const char *name);
 static void free_process(struct proc *p);
 static void proc_trampoline(void) __attribute__((noreturn));
+int priority_to_level(int priority);
 
 int mycpuid(void)
 {
@@ -52,6 +57,9 @@ void proc_init(void)
 
     for (int i = 0; i < NCPU; i++) {
         cpus[i].id = i;
+        for (int level = 0; level < MLFQ_LEVELS; level++) {
+            cpus[i].last_sched_index[level] = -1;
+        }
     }
     for (int i = 0; i < NPROC; i++) {
         spinlock_init(&proc_table[i].lock, "proc");
@@ -89,6 +97,12 @@ static struct proc* alloc_process(void (*entry)(void), const char *name)
     p->exit_code = 0;
     p->killed = 0;
     p->chan = 0;
+    p->priority = PRIORITY_DEFAULT;
+    p->queue_level = priority_to_level(p->priority);
+    p->ticks_in_level = 0;
+    p->wait_ticks = 0;
+    p->rt_enabled = 0;
+    p->rt_deadline = 0;
     p->sz = 0;
     p->pagetable = 0;
     p->trapframe = 0;
@@ -236,6 +250,68 @@ int kill_process(int pid)
     return -1;
 }
 
+int setpriority(int pid, int priority)
+{
+    if (priority < PRIORITY_MIN) {
+        priority = PRIORITY_MIN;
+    } else if (priority > PRIORITY_MAX) {
+        priority = PRIORITY_MAX;
+    }
+
+    for (int i = 0; i < NPROC; i++) {
+        struct proc *p = &proc_table[i];
+        spinlock_acquire(&p->lock);
+        if (p->state != PROC_UNUSED && p->pid == pid) {
+            p->priority = priority;
+            p->queue_level = priority_to_level(priority);
+            p->ticks_in_level = 0;
+            p->wait_ticks = 0;
+            spinlock_release(&p->lock);
+            return 0;
+        }
+        spinlock_release(&p->lock);
+    }
+    return -1;
+}
+
+int getpriority(int pid)
+{
+    for (int i = 0; i < NPROC; i++) {
+        struct proc *p = &proc_table[i];
+        spinlock_acquire(&p->lock);
+        if (p->state != PROC_UNUSED && p->pid == pid) {
+            int prio = p->priority;
+            spinlock_release(&p->lock);
+            return prio;
+        }
+        spinlock_release(&p->lock);
+    }
+    return -1;
+}
+
+int setrealtime(int pid, int deadline)
+{
+    if (deadline <= 0) {
+        return -1;
+    }
+    uint64 now = timer_get_ticks();
+    for (int i = 0; i < NPROC; i++) {
+        struct proc *p = &proc_table[i];
+        spinlock_acquire(&p->lock);
+        if (p->state != PROC_UNUSED && p->pid == pid) {
+            p->rt_enabled = 1;
+            p->rt_deadline = now + (uint64)deadline;
+            // pin to highest queue for fairness fallback
+            p->queue_level = 0;
+            p->ticks_in_level = 0;
+            spinlock_release(&p->lock);
+            return 0;
+        }
+        spinlock_release(&p->lock);
+    }
+    return -1;
+}
+
 void userinit(void)
 {
     struct proc *p = alloc_process(NULL, "init");
@@ -279,6 +355,10 @@ int fork_process(void)
 
     np->parent = p;
     np->sz = p->sz;
+    np->priority = p->priority;
+    np->queue_level = p->queue_level;
+    np->ticks_in_level = 0;
+    np->wait_ticks = 0;
 
     np->pagetable = proc_pagetable(np);
     if (!np->pagetable) {
@@ -326,6 +406,7 @@ void yield(void)
         return;
 
     spinlock_acquire(&p->lock);
+    p->ticks_in_level = 0;
     p->state = PROC_RUNNABLE;
     spinlock_release(&p->lock);
     swtch(&p->ctx, &c->ctx);
@@ -339,23 +420,66 @@ void scheduler(void)
     for (;;) {
         intr_on();
 
+        struct proc *selected = 0;
+        int selected_level = -1;
+        int selected_index = -1;
+
+        // First, pick realtime tasks by earliest deadline (simple EDF).
+        uint64 best_deadline = (uint64)-1;
         for (int i = 0; i < NPROC; i++) {
             struct proc *p = &proc_table[i];
-
             spinlock_acquire(&p->lock);
-            if (p->state != PROC_RUNNABLE) {
-                spinlock_release(&p->lock);
-                continue;
+            if (p->state == PROC_RUNNABLE && p->rt_enabled) {
+                if (p->rt_deadline < best_deadline) {
+                    best_deadline = p->rt_deadline;
+                    selected = p;
+                    selected_level = p->queue_level;
+                    selected_index = i;
+                }
+            }
+            spinlock_release(&p->lock);
+        }
+
+        if (selected) {
+            goto schedule_pick;
+        }
+
+        for (int level = 0; level < MLFQ_LEVELS; level++) {
+            int start_index = 0;
+            if (c->last_sched_index[level] >= 0) {
+                start_index = (c->last_sched_index[level] + 1) % NPROC;
             }
 
-            c->proc = p;
-            p->state = PROC_RUNNING;
-            spinlock_release(&p->lock);
+            for (int offset = 0; offset < NPROC; offset++) {
+                int i = (start_index + offset) % NPROC;
+                struct proc *p = &proc_table[i];
 
-            swtch(&c->ctx, &p->ctx);
-
-            c->proc = 0;
+                spinlock_acquire(&p->lock);
+                if (p->state == PROC_RUNNABLE && p->queue_level == level) {
+                    selected = p;
+                    selected_level = level;
+                    selected_index = i;
+                    goto schedule_pick;
+                }
+                spinlock_release(&p->lock);
+            }
         }
+
+    schedule_pick:
+        if (!selected) {
+            continue;
+        }
+
+        c->last_sched_index[selected_level] = selected_index;
+        selected->state = PROC_RUNNING;
+        selected->ticks_in_level = 0;
+        selected->wait_ticks = 0;
+        c->proc = selected;
+        spinlock_release(&selected->lock);
+
+        swtch(&c->ctx, &selected->ctx);
+
+        c->proc = 0;
     }
 }
 
@@ -418,6 +542,82 @@ void proc_freepagetable(pagetable_t pagetable, uint64 sz)
     uvmfree(pagetable, sz);
 }
 
+int priority_to_level(int priority)
+{
+    if (priority <= PRIORITY_MIN)
+        return MLFQ_LEVELS - 1;
+    if (priority >= PRIORITY_MAX)
+        return 0;
+
+    int range = PRIORITY_MAX - PRIORITY_MIN;
+    if (range <= 0)
+        return 0;
+
+    int normalized = (priority - PRIORITY_MIN) * (MLFQ_LEVELS - 1) / range;
+    int level = (MLFQ_LEVELS - 1) - normalized;
+    if (level < 0)
+        level = 0;
+    if (level >= MLFQ_LEVELS)
+        level = MLFQ_LEVELS - 1;
+    return level;
+}
+
+int proc_tick(void)
+{
+    struct proc *p = myproc();
+    if (!p)
+        return 0;
+
+    spinlock_acquire(&p->lock);
+    if (p->state != PROC_RUNNING) {
+        spinlock_release(&p->lock);
+        return 0;
+    }
+
+    p->ticks_in_level++;
+    int quantum = mlfq_quantum[p->queue_level];
+    if (p->ticks_in_level >= quantum) {
+        if (p->queue_level < MLFQ_LEVELS - 1) {
+            p->queue_level++;
+        }
+        p->ticks_in_level = 0;
+        spinlock_release(&p->lock);
+        return 1;
+    }
+
+    spinlock_release(&p->lock);
+    return 0;
+}
+
+void proc_boost(void)
+{
+    for (int i = 0; i < NPROC; i++) {
+        struct proc *p = &proc_table[i];
+        spinlock_acquire(&p->lock);
+        p->queue_level = priority_to_level(p->priority);
+        p->ticks_in_level = 0;
+        spinlock_release(&p->lock);
+    }
+}
+
+void proc_age(void)
+{
+    for (int i = 0; i < NPROC; i++) {
+        struct proc *p = &proc_table[i];
+        spinlock_acquire(&p->lock);
+        if (p->state == PROC_RUNNABLE) {
+            p->wait_ticks++;
+            if (p->wait_ticks >= mlfq_aging_threshold && p->queue_level > 0) {
+                p->queue_level--;
+                p->wait_ticks = 0;
+            }
+        } else if (p->state == PROC_RUNNING) {
+            p->wait_ticks = 0;
+        }
+        spinlock_release(&p->lock);
+    }
+}
+
 int growproc(int n)
 {
     struct proc *p = myproc();
@@ -474,12 +674,18 @@ static void free_process(struct proc *p)
     }
 
     p->pid = 0;
+    p->rt_enabled = 0;
+    p->rt_deadline = 0;
     p->parent = 0;
     p->exit_code = 0;
     p->killed = 0;
     p->chan = 0;
     p->entry = 0;
     p->name[0] = '\0';
+    p->queue_level = MLFQ_LEVELS - 1;
+    p->ticks_in_level = 0;
+    p->wait_ticks = 0;
+    p->priority = PRIORITY_MIN;
     p->state = PROC_UNUSED;
 }
 

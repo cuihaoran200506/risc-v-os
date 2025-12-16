@@ -11,6 +11,10 @@ int read(int, void *, int);
 int write(int, const void *, int);
 int close(int);
 int kill(int);
+int setpriority(int, int);
+int getpriority(int);
+int klog(char *, int);
+int setrealtime(int pid, int deadline);
 int exec(const char *, char **);
 int open(const char *, int);
 int mknod(const char *, short, short);
@@ -24,5 +28,10 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+int msgget(int key);
+int msgsend(int qid, const void *buf, int len);
+int msgrecv(int qid, void *buf, int maxlen);
+int strlen(const char *s);
+void puts(const char *s);
 
 #endif

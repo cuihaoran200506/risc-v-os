@@ -245,8 +245,18 @@ void timer_interrupt_handler()
     }
 
     struct proc *p = myproc();
-    if (p && p->state == PROC_RUNNING) {
+    if (p && proc_tick()) {
         yield();
+    }
+
+    proc_age();
+    static int boost_counter = 0;
+    if (mycpuid() == 0) {
+        boost_counter++;
+        if (boost_counter >= 64) {
+            boost_counter = 0;
+            proc_boost();
+        }
     }
 }
 
@@ -331,6 +341,12 @@ static void usertrap(void)
         syscall();
     } else if (handle_interrupt(scause)) {
         // 设备中断已处理
+    } else if (scause == 13 || scause == 15) { // load/store page fault
+        uint64 stval = r_stval();
+        if (cow_handle(p->pagetable, stval) < 0) {
+            printf("usertrap: page fault va=%p pid=%d\n", stval, p->pid);
+            p->killed = 1;
+        }
     } else {
         uint64 stval = r_stval();
         printf("usertrap: unexpected scause=%p stval=%p pid=%d\n",

@@ -9,6 +9,10 @@
 #define NPROC 16   // 允许存在的最大进程数
 #define NOFILE 16
 #define EXEC_MAXARG 16   // exec 调用支持的最大参数个数
+#define PRIORITY_MIN 0
+#define PRIORITY_MAX 10
+#define PRIORITY_DEFAULT 5
+#define MLFQ_LEVELS 3
 
 struct trapframe {
     uint64 kernel_satp;     // 内核页表（返回内核时使用）
@@ -88,6 +92,12 @@ struct proc {
     int exit_code;
     int killed;
     void *chan;           // sleep/wakeup 使用
+    int priority;
+    int queue_level;
+    int ticks_in_level;
+    int wait_ticks;
+    int rt_enabled;
+    uint64 rt_deadline;
     char name[16];
 
     uint64 kstack;        // 内核栈底（低地址）
@@ -107,6 +117,7 @@ struct cpu {
     struct context ctx;   // 调度器上下文
     int id;
     int started;
+    int last_sched_index[MLFQ_LEVELS];
 };
 
 typedef struct cpu cpu_t;
@@ -126,6 +137,9 @@ void yield(void);
 void sleep(void *chan, spinlock_t *lk);
 void wakeup(void *chan);
 int kill_process(int pid);
+int setpriority(int pid, int priority);
+int getpriority(int pid);
+int setrealtime(int pid, int deadline);
 pagetable_t proc_pagetable(struct proc *p);
 void proc_freepagetable(pagetable_t pagetable, uint64 sz);
 int growproc(int n);
@@ -133,5 +147,9 @@ int fork_process(void);
 int exec_process(struct proc *p, const char *path, const char *const argv[]);
 void userinit(void);
 void scheduler(void) __attribute__((noreturn));
+int proc_tick(void);
+void proc_boost(void);
+void proc_age(void);
+int priority_to_level(int priority);
 
 #endif

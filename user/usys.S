@@ -25,3 +25,10 @@ SYSCALL fstat,   16
 SYSCALL unlink,  17
 SYSCALL link,    18
 SYSCALL dup,     19
+SYSCALL setpriority, 20
+SYSCALL getpriority, 21
+SYSCALL klog, 22
+SYSCALL setrealtime, 23
+SYSCALL msgget, 24
+SYSCALL msgsend, 25
+SYSCALL msgrecv, 26

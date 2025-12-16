@@ -58,6 +58,8 @@ typedef uint64* pagetable_t;
 #define PTE_G (1 << 5) // global
 #define PTE_A (1 << 6) // accessed
 #define PTE_D (1 << 7) // dirty
+// Software-reserved COW flag
+#define PTE_C (1 << 8)
 
 // 检查一个PTE是否属于pgtbl
 #define PTE_CHECK(pte) (((pte) & (PTE_R | PTE_W | PTE_X)) == 0)
@@ -85,6 +87,7 @@ uint64 uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz);
 uint64 uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz);
 int    uvmcopy(pagetable_t old, pagetable_t new_pt, uint64 sz);
 void   uvmclear(pagetable_t pagetable, uint64 va);
+int    cow_handle(pagetable_t pagetable, uint64 va);
 
 void   kvm_init();
 void   kvm_inithart();

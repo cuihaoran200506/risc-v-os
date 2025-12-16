@@ -30,6 +30,13 @@ extern int sys_fstat(void);
 extern int sys_unlink(void);
 extern int sys_link(void);
 extern int sys_dup(void);
+extern int sys_setpriority(void);
+extern int sys_getpriority(void);
+extern int sys_klog(void);
+extern int sys_setrealtime(void);
+extern int sys_msgget(void);
+extern int sys_msgsend(void);
+extern int sys_msgrecv(void);
 
 static struct syscall_desc syscall_table[SYS_MAX] = {
     [SYS_fork]   = { sys_fork,   "fork",   0 },
@@ -37,6 +44,13 @@ static struct syscall_desc syscall_table[SYS_MAX] = {
     [SYS_wait]   = { sys_wait,   "wait",   1 },
     [SYS_kill]   = { sys_kill,   "kill",   1 },
     [SYS_getpid] = { sys_getpid, "getpid", 0 },
+    [SYS_setpriority] = { sys_setpriority, "setpriority", 2 },
+    [SYS_getpriority] = { sys_getpriority, "getpriority", 1 },
+    [SYS_klog]   = { sys_klog,   "klog",   2 },
+    [SYS_setrealtime] = { sys_setrealtime, "setrealtime", 2 },
+    [SYS_msgget] = { sys_msgget, "msgget", 1 },
+    [SYS_msgsend]= { sys_msgsend,"msgsend",3 },
+    [SYS_msgrecv]= { sys_msgrecv,"msgrecv",3 },
     [SYS_pipe]   = { sys_pipe,   "pipe",   1 },
     [SYS_open]   = { sys_open,   "open",   2 },
     [SYS_close]  = { sys_close,  "close",  1 },

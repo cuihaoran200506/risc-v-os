@@ -20,6 +20,10 @@ typedef enum {false = 0, true = 1} bool;
 #define NULL ((void*)0)
 #endif
 
+#define ROOTDEV 1
+#define ROOTINO 1
+#define MAX_LOG_LEN 256
+
 #define NCPU 2
 
 #endif

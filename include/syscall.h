@@ -29,6 +29,13 @@ enum syscall_number {
     SYS_unlink,
     SYS_link,
     SYS_dup,
+    SYS_setpriority,
+    SYS_getpriority,
+    SYS_klog,
+    SYS_setrealtime,
+    SYS_msgget,
+    SYS_msgsend,
+    SYS_msgrecv,
     SYS_MAX,
 };
 

@@ -4,7 +4,7 @@ INLCUDES := ../../include
 # 选出所有后缀为.c或.S的文件,将其名称后缀替换为.o,作为输出目标
 target = $(shell ls *.c *.S 2>/dev/null | awk '{gsub(/\.c|\.S/, ".o"); print $0}')
 
-USER_INIT_BIN = ../../user/init.bin
+USER_BINS = ../../user/init.elf ../../user/logread.elf ../../user/nice.elf ../../user/elfdemo.elf ../../user/msgdemo.elf ../../user/cowtest.elf ../../user/rtdemo.elf
 
 .PHONY: clean
 
@@ -17,7 +17,7 @@ include ../../common.mk
 %.o: %.c
 	$(CC) $(CFLAGS) -I $(INLCUDES) -c $<
 
-initbin.o: initbin.S $(USER_INIT_BIN)
+initbin.o: initbin.S $(USER_BINS)
 
 build: $(target)
 	

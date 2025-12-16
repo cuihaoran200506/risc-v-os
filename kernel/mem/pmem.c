@@ -11,6 +11,8 @@
 
 static uint8 kern_state[MAX_KERNEL_PAGES];
 static uint8 user_state[MAX_USER_PAGES];
+static uint16 kern_refcnt[MAX_KERNEL_PAGES];
+static uint16 user_refcnt[MAX_USER_PAGES];
 
 typedef struct page_node { 
     struct page_node* next;
@@ -28,6 +30,7 @@ typedef struct alloc_region {
     // 新增：总页数 + 每页状态
     uint32 total_pages;
     uint8* state;    // 指向一个长度为 total_pages 的数组
+    uint16* refcnt;  // 每页引用计数
 } alloc_region_t; 
 // 内核和用户可分配的物理页分开
 
@@ -52,7 +55,9 @@ void pmem_init(void) {
     spinlock_init(&kern_region.lk, "kernel_pmem_lock");
     kern_region.total_pages = KERNEL_PAGES;
     kern_region.state       = kern_state;
+    kern_region.refcnt      = kern_refcnt;
     memset(kern_region.state, 0, sizeof(kern_state)); // 初始都“未使用”
+    memset(kern_region.refcnt, 0, sizeof(kern_refcnt));
 
     // 初始化用户物理页区域
     user_region.begin = kern_region.end;
@@ -62,7 +67,9 @@ void pmem_init(void) {
     spinlock_init(&user_region.lk, "user_pmem_lock");
     user_region.total_pages = (user_region.end - user_region.begin) / PGSIZE;
     user_region.state       = user_state;
+    user_region.refcnt      = user_refcnt;
     memset(user_region.state, 0, sizeof(user_state));
+    memset(user_region.refcnt, 0, sizeof(user_refcnt));
 
     // 逆序初始化，让低地址页面先被分配
     for (uint64 p = kern_region.end - PGSIZE; p >= kern_region.begin; p -= PGSIZE) {
@@ -92,6 +99,7 @@ void pmem_free(uint64 page, bool in_kernel) {
         panic("pmem_free: double free detected (page already free)");
     }
     region->state[idx] = 1;  // 标记为空闲
+    region->refcnt[idx] = 0;
 
     memset((void*)page, 1, PGSIZE);
     // 将页面地址转换为 page_node_t 指针
@@ -122,6 +130,8 @@ void* pmem_alloc(bool in_kernel) {
             // 你可以 panic 或者至少打印 warning
         }
         region->state[idx] = 0;  // 标记为“已分配”
+        region->refcnt[idx] = 1;
+        region->refcnt[idx] = 1;
     }
     spinlock_release(&region->lk);
 
@@ -131,6 +141,76 @@ void* pmem_alloc(bool in_kernel) {
 
     // 如果成功分配，返回页面地址；否则返回 NULL
     return (void*)node;
+}
+
+static int region_incref(alloc_region_t *region, uint64 page)
+{
+    if (page < region->begin || page >= region->end)
+        return -1;
+    uint32 idx = page_index(region, page);
+    spinlock_acquire(&region->lk);
+    if (region->state[idx] == 1) {
+        spinlock_release(&region->lk);
+        return -1;
+    }
+    int r = ++region->refcnt[idx];
+    spinlock_release(&region->lk);
+    return r;
+}
+
+static int region_decref(alloc_region_t *region, uint64 page)
+{
+    if (page < region->begin || page >= region->end)
+        return -1;
+    uint32 idx = page_index(region, page);
+    spinlock_acquire(&region->lk);
+    if (region->state[idx] == 1 || region->refcnt[idx] == 0) {
+        spinlock_release(&region->lk);
+        return -1;
+    }
+    int r = --region->refcnt[idx];
+    if (r == 0) {
+        memset((void*)page, 1, PGSIZE);
+        page_node_t* node = (page_node_t*)page;
+        node->next = region->list_head.next;
+        region->list_head.next = node;
+        region->allocable++;
+        region->state[idx] = 1;
+    }
+    spinlock_release(&region->lk);
+    return r;
+}
+
+static int region_refcount(alloc_region_t *region, uint64 page)
+{
+    if (page < region->begin || page >= region->end)
+        return -1;
+    uint32 idx = page_index(region, page);
+    spinlock_acquire(&region->lk);
+    int r = region->refcnt[idx];
+    spinlock_release(&region->lk);
+    return r;
+}
+
+int pmem_incref(uint64 page)
+{
+    int r = region_incref(&kern_region, page);
+    if (r >= 0) return r;
+    return region_incref(&user_region, page);
+}
+
+int pmem_decref(uint64 page)
+{
+    int r = region_decref(&kern_region, page);
+    if (r >= 0) return r;
+    return region_decref(&user_region, page);
+}
+
+int pmem_refcount(uint64 page)
+{
+    int r = region_refcount(&kern_region, page);
+    if (r >= 0) return r;
+    return region_refcount(&user_region, page);
 }
 
 // pmem_alloc_pages(: 分配多个物理页面)

@@ -2,9 +2,11 @@ include ../common.mk
 
 INCLUDES := ../include
 
-USER_OBJS := crt0.o usys.o ulib.o init.o
-USER_ELF := init.elf
-USER_BIN := init.bin
+COMMON_OBJS := crt0.o usys.o ulib.o
+USER_PROGS := init nice logread elfdemo msgdemo cowtest rtdemo
+USER_ELFS := $(USER_PROGS:%=%.elf)
+USER_BINS := $(USER_PROGS:%=%.bin)
+.SECONDARY: $(USER_ELFS)
 
 .PHONY: build clean
 
@@ -14,13 +16,13 @@ USER_BIN := init.bin
 %.o: %.S
 	$(CC) $(CFLAGS) -I$(INCLUDES) -c $< -o $@
 
-build: $(USER_BIN)
+build: $(USER_BINS) $(USER_ELFS)
 
-$(USER_ELF): $(USER_OBJS) init.ld
-	$(LD) -T init.ld -o $@ $(USER_OBJS)
+%.elf: $(COMMON_OBJS) %.o init.ld
+	$(LD) -T init.ld -o $@ $(COMMON_OBJS) $*.o
 
-$(USER_BIN): $(USER_ELF)
+%.bin: %.elf
 	$(OBJCOPY) -O binary $< $@
 
 clean:
-	rm -f $(USER_OBJS) $(USER_ELF) $(USER_BIN) *.d
+	rm -f $(COMMON_OBJS) $(USER_PROGS:%=%.o) $(USER_ELFS) $(USER_BINS) *.d

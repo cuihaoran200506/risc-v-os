@@ -122,7 +122,7 @@ void vm_unmappages(pgtbl_t pgtbl, uint64 va, uint64 len, bool freeit) {
                     pmem_free(pa, true);
                 } else if (pa >= PG_ROUND_UP((uint64)ALLOC_BEGIN) + 1024 * PGSIZE && pa < PHYSTOP) {
                     // 物理地址在用户区
-                    pmem_free(pa, false);
+                    pmem_decref(pa);
                 } else {
                     // 物理地址不在任何一个可管理区域内, 这是一个严重错误   
                     panic("vm_unmappages: pa out of any known region");
@@ -329,11 +329,52 @@ uint64 vm_walkaddr(pgtbl_t pgtbl, uint64 va)
     return PTE_TO_PA(*pte);
 }
 
+int cow_handle(pagetable_t pagetable, uint64 va)
+{
+    uint64 a = PG_ROUND_DOWN(va);
+    pte_t *pte = vm_getpte(pagetable, a, false);
+    if (!pte || (*pte & PTE_V) == 0 || (*pte & PTE_C) == 0) {
+        return -1;
+    }
+    uint64 pa = PTE_TO_PA(*pte);
+    int ref = pmem_refcount(pa);
+    if (ref < 0) {
+        return -1;
+    }
+
+    if (ref == 1) {
+        // Only this mapping; just flip to writable.
+        *pte = (*pte | PTE_W) & ~PTE_C;
+        sfence_vma();
+        return 0;
+    }
+
+    void *mem = pmem_alloc(false);
+    if (!mem) {
+        return -1;
+    }
+    memmove(mem, (void*)pa, PGSIZE);
+    pmem_decref(pa);
+    uint64 flags = (PTE_FLAGS(*pte) | PTE_W) & ~PTE_C;
+    *pte = PA_TO_PTE((uint64)mem) | flags;
+    sfence_vma();
+    return 0;
+}
+
 int copyout(pgtbl_t pgtbl, uint64 dstva, const void *src, uint64 len)
 {
     const uint8 *s = (const uint8*)src;
     while (len > 0) {
         uint64 va0 = PG_ROUND_DOWN(dstva);
+        pte_t *pte = vm_getpte(pgtbl, va0, false);
+        if (pte == NULL || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0) {
+            return -1;
+        }
+        if (*pte & PTE_C) {
+            if (cow_handle(pgtbl, va0) < 0) {
+                return -1;
+            }
+        }
         uint64 pa0 = vm_walkaddr(pgtbl, va0);
         if (pa0 == 0) {
             return -1;
@@ -447,7 +488,7 @@ uint64 uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
             continue;
         }
         uint64 pa = PTE_TO_PA(*pte);
-        pmem_free(pa, false);
+        pmem_decref(pa);
         *pte = 0;
     }
     return newsz;
@@ -468,16 +509,20 @@ int uvmcopy(pagetable_t old, pagetable_t new_pt, uint64 sz)
         if (pte == NULL || (*pte & PTE_V) == 0) {
             continue;
         }
+        if (!(*pte & PTE_U)) {
+            continue;
+        }
         uint64 pa = PTE_TO_PA(*pte);
         uint64 flags = PTE_FLAGS(*pte);
-        void *mem = pmem_alloc(false);
-        if (mem == NULL) {
+        flags = (flags & ~PTE_W) | PTE_C;
+        if (pmem_incref(pa) < 0) {
             uvmdealloc(new_pt, a, 0);
             return -1;
         }
-        memcpy(mem, (void*)pa, PGSIZE);
-        vm_mappages(new_pt, a, (uint64)mem, PGSIZE, flags);
+        vm_mappages(new_pt, a, pa, PGSIZE, flags);
+        *pte = PA_TO_PTE(pa) | flags;
     }
+    sfence_vma();
     return 0;
 }
 
